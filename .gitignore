@@ -1,0 +1,12 @@
+# Nunca versionar chaves, backups ou dados do CRM.
+.env
+.env.*
+.vercel
+*.json.bak
+backups/
+gravv-privado-*.json
+estado.json
+__pycache__/
+*.pyc
+.DS_Store
+Thumbs.db
