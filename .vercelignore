@@ -1,0 +1,7 @@
+tests/
+supabase/
+*.md
+backups/
+gravv-privado-*.json
+estado.json
+*.cmd
