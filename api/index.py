@@ -19,10 +19,13 @@ import hashlib
 import hmac
 from http.cookies import CookieError, SimpleCookie
 from http.server import BaseHTTPRequestHandler
+from concurrent.futures import ThreadPoolExecutor
 import json
 import os
 import re
 import sys
+import threading
+import time
 import traceback
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, parse_qsl, quote, urlencode, urlsplit
@@ -512,9 +515,79 @@ def auth_token(grant, payload):
     return None
 
 
+# Cache curto da validação do token: evita uma ida ao Supabase Auth em cada chamada da mesma sessão.
+_AUTH_CACHE = {}
+_AUTH_LOCK = threading.Lock()
+AUTH_CACHE_SECONDS = 120
+
+
+def _token_key(access):
+    return hashlib.sha256(access.encode()).hexdigest()
+
+
+def auth_forget(access):
+    if access:
+        with _AUTH_LOCK:
+            _AUTH_CACHE.pop(_token_key(access), None)
+
+
 def auth_user(access):
+    key, now = _token_key(access), time.time()
+    with _AUTH_LOCK:
+        hit = _AUTH_CACHE.get(key)
+        if hit and hit[0] > now:
+            return hit[1]
     status, data = supabase('GET', '/auth/v1/user', user_token=access)
-    return data if status == 200 and isinstance(data, dict) else None
+    user = data if status == 200 and isinstance(data, dict) else None
+    if user:
+        with _AUTH_LOCK:
+            if len(_AUTH_CACHE) > 200:
+                _AUTH_CACHE.clear()
+            _AUTH_CACHE[key] = (now + AUTH_CACHE_SECONDS, user)
+    return user
+
+
+# Leituras em lote: várias consultas numa chamada só, feitas em paralelo no servidor.
+_POOL = ThreadPoolExecutor(max_workers=12)
+MAX_BATCH = 24
+REF_QUERIES = {
+    'stages': ('pipeline_stages', 'order=posicao.asc'),
+    'categories': ('financial_categories', 'order=nome.asc'),
+    'accounts': ('v_account_balances', 'order=nome.asc'),
+    'services': ('services', 'order=nome.asc'),
+    'clients': ('clients', 'select=id,nome,status,telefone,email&order=nome.asc'),
+    'settings': ('settings', ''),
+}
+
+
+def _one_read(item):
+    table, query = item
+    try:
+        return {'data': db_read(table, query)}
+    except RequestError as exc:
+        return {'error': str(exc), 'status': exc.status}
+
+
+def db_batch(items):
+    if not isinstance(items, list) or not items or len(items) > MAX_BATCH:
+        raise RequestError('Consulta em lote inválida.')
+    clean_items = []
+    for item in items:
+        if not (isinstance(item, list) and len(item) == 2 and all(isinstance(x, str) for x in item)) or len(item[1]) > 2000:
+            raise RequestError('Consulta em lote inválida.')
+        clean_items.append((item[0], item[1]))
+    return list(_POOL.map(_one_read, clean_items))
+
+
+def ref_data():
+    names = list(REF_QUERIES)
+    results = db_batch([list(REF_QUERIES[n]) for n in names])
+    out = {}
+    for name, res in zip(names, results):
+        if 'error' in res:
+            raise RequestError(res['error'], res.get('status', 400))
+        out[name] = res['data']
+    return out
 
 
 # --------------------------------------------------------------------------- HTTP
@@ -721,6 +794,12 @@ class handler(BaseHTTPRequestHandler):  # nome exigido pelo runtime Python da Ve
             self._reply(200, {'ok': True})
             return
         if method == 'POST' and path == '/api/logout':
+            cookie = SimpleCookie()
+            try:
+                cookie.load(self.headers.get('Cookie', ''))
+                auth_forget(cookie.get(ACCESS_COOKIE).value if cookie.get(ACCESS_COOKIE) else '')
+            except CookieError:
+                pass
             self._clear_session_cookies()
             self._reply(200, {'ok': True})
             return
@@ -748,9 +827,17 @@ class handler(BaseHTTPRequestHandler):  # nome exigido pelo runtime Python da Ve
         if method != 'GET':
             raise RequestError('Método não aceito.', 405)
         if path == '/api/session':
-            self._reply(200, {'authenticated': True, 'csrf': session['csrf'], 'today': today(),
-                              'owner': env('OWNER_NAME', 'Marcos'), 'email': session['email'],
-                              'owners': sorted(owners())})
+            info = {'authenticated': True, 'csrf': session['csrf'], 'today': today(),
+                    'owner': env('OWNER_NAME', 'Marcos'), 'email': session['email'], 'owners': sorted(owners())}
+            if parse_qs(query).get('ref') == ['1']:
+                info['ref'] = ref_data()
+            self._reply(200, info)
+        elif path == '/api/batch':
+            try:
+                items = json.loads(parse_qs(query).get('q', [''])[0])
+            except ValueError:
+                raise RequestError('Consulta em lote inválida.')
+            self._reply(200, {'results': db_batch(items)})
         elif path == '/api/backup':
             self._reply(200, json.dumps(backup(), ensure_ascii=False, indent=1), 'application/json; charset=utf-8',
                         {'Content-Disposition': f'attachment; filename="gravv-crm-backup-{today()}.json"'})
