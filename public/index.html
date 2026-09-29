@@ -1,4 +1,66 @@
 <!doctype html>
 <html lang="pt-BR">
-<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="color-scheme" content="light"><meta name="robots" content="noindex,nofollow"><title>GRAVV · Central da empresa</title><link rel="icon" href="/favicon.svg" type="image/svg+xml"><link rel="stylesheet" href="/styles.css"><script src="/app.js" defer></script></head>
-<body><a class="skip" href="#content">Ir para o conteúdo</a><div id="shell" hidden><aside class="sidebar"><a class="brand" href="#overview" data-page="overview" aria-label="GRAVV, visão geral"><img src="/logo.png" alt="GRAVV" width="148" height="52"></a><div class="workspace-label">CENTRAL DA EMPRESA</div><nav aria-label="Navegação principal" id="nav"></nav><div class="sidebar-footer"><span class="status-dot"></span> Operação online e privada<small>Presença com peso.</small></div></aside><div class="workspace"><header class="topbar"><button id="menu-toggle" class="icon-button" aria-label="Abrir menu" aria-expanded="false">☰</button><span class="breadcrumb">GRAVV <span>/</span> <span id="breadcrumb">Visão geral</span></span><span class="owner"><span class="avatar" id="avatar">M</span> <span id="owner-name">Marcos</span> <small>PROPRIETÁRIO</small><button type="button" class="subtle logout" data-action="logout">Sair</button></span></header><main id="content" tabindex="-1"><div class="page-heading"><div><p class="eyebrow" id="eyebrow">SEU CENTRO DE OPERAÇÃO</p><h1 id="page-title">Visão geral</h1><p id="page-subtitle"></p></div><div id="page-actions" class="actions"></div></div><div id="page-body"></div></main><footer class="workspace-footer"><span>GRAVV / GESTÃO</span><span id="updated"></span></footer></div></div><section id="gate" class="gate"><div class="gate-mark">GRAVV</div><p class="eyebrow">CENTRAL PRIVADA</p><h1 id="gate-title">Abrindo sua operação.</h1><p id="gate-message">Verificando o acesso…</p><form id="login-form" class="login-form" hidden><label class="field" for="login-email">E-mail<input id="login-email" type="email" autocomplete="username" required></label><label class="field" for="login-password">Senha<input id="login-password" type="password" autocomplete="current-password" required></label><p id="login-error" class="form-error" role="alert"></p><button id="login-button" class="primary" type="submit">Entrar</button></form><button id="retry" class="primary" hidden>Tentar novamente</button></section><dialog id="dialog" aria-labelledby="dialog-title"><form id="record-form"><div class="dialog-head"><div><p class="eyebrow">REGISTRO NA OPERAÇÃO</p><h2 id="dialog-title"></h2></div><button type="button" data-close class="icon-button" aria-label="Fechar">✕</button></div><div id="dialog-fields"></div><p id="form-error" class="form-error" role="alert"></p><div class="dialog-actions"><button type="button" data-close>Cancelar</button><button class="primary" id="save-button" type="submit">Salvar registro</button></div></form></dialog><div id="toast" class="toast" role="status" aria-live="polite" hidden></div></body></html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="color-scheme" content="light">
+<meta name="robots" content="noindex,nofollow">
+<title>GRAVV · CRM</title>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/styles.css">
+<script src="/js/core.js" defer></script>
+<script src="/js/comercial.js" defer></script>
+<script src="/js/clientes.js" defer></script>
+<script src="/js/financeiro.js" defer></script>
+<script src="/js/gestao.js" defer></script>
+</head>
+<body>
+<a class="skip" href="#content">Ir para o conteúdo</a>
+<div id="shell" hidden>
+  <aside class="sidebar" id="sidebar">
+    <a class="brand" href="#/"><img src="/logo.png" alt="GRAVV" width="120" height="42"></a>
+    <nav id="nav" aria-label="Navegação principal"></nav>
+    <div class="side-foot">
+      <a href="#/configuracoes" data-nav="configuracoes" class="nav-link"><span class="ico" data-ico="gear"></span>Configurações</a>
+      <button type="button" class="nav-link" data-action="logout"><span class="ico" data-ico="out"></span>Sair</button>
+    </div>
+  </aside>
+  <div class="workspace">
+    <header class="topbar">
+      <button id="menu-toggle" class="icon-btn" type="button" aria-label="Abrir menu" aria-expanded="false">☰</button>
+      <h1 id="page-title">Dashboard</h1>
+      <div class="top-search"><input id="global-search" type="search" placeholder="Buscar cliente, lead, projeto…" aria-label="Busca global" autocomplete="off"><div id="search-results" class="dropdown" hidden></div></div>
+      <div class="top-actions">
+        <button type="button" class="icon-btn bell" id="bell" aria-label="Notificações"><span class="ico" data-ico="bell"></span><span id="bell-count" class="dot-count" hidden></span></button>
+        <div id="bell-menu" class="dropdown right" hidden></div>
+        <button type="button" class="primary" id="new-btn">+ Novo</button>
+        <div id="new-menu" class="dropdown right" hidden></div>
+      </div>
+    </header>
+    <main id="content" tabindex="-1"></main>
+  </div>
+</div>
+<section id="gate" class="gate">
+  <div class="gate-mark">GRAVV</div>
+  <h2 id="gate-title">Abrindo o CRM…</h2>
+  <p id="gate-message" class="muted"></p>
+  <form id="login-form" class="login-form" hidden>
+    <label class="field">E-mail<input id="login-email" type="email" autocomplete="username" required></label>
+    <label class="field">Senha<input id="login-password" type="password" autocomplete="current-password" required></label>
+    <p id="login-error" class="form-error" role="alert"></p>
+    <button id="login-button" class="primary" type="submit">Entrar</button>
+  </form>
+  <button id="retry" class="primary" type="button" hidden>Tentar de novo</button>
+</section>
+<div id="sheet-backdrop" class="sheet-backdrop" hidden></div>
+<aside id="sheet" class="sheet" role="dialog" aria-modal="true" aria-labelledby="sheet-title" hidden>
+  <form id="sheet-form" novalidate>
+    <header class="sheet-head"><h2 id="sheet-title"></h2><button type="button" class="icon-btn" data-close aria-label="Fechar">✕</button></header>
+    <div id="sheet-body" class="sheet-body"></div>
+    <p id="sheet-error" class="form-error" role="alert"></p>
+    <footer class="sheet-foot" id="sheet-foot"></footer>
+  </form>
+</aside>
+<div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+</body>
+</html>
