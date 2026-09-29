@@ -2,17 +2,24 @@
 <html lang="pt-BR">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#0B0B0B">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black">
+<meta name="apple-mobile-web-app-title" content="GRAVV CRM">
 <meta name="color-scheme" content="light">
 <meta name="robots" content="noindex,nofollow">
 <title>GRAVV · CRM</title>
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
-<link rel="stylesheet" href="/styles.css">
-<script src="/js/core.js" defer></script>
-<script src="/js/comercial.js" defer></script>
-<script src="/js/clientes.js" defer></script>
-<script src="/js/financeiro.js" defer></script>
-<script src="/js/gestao.js" defer></script>
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="stylesheet" href="/styles.css?v=3">
+<script src="/js/core.js?v=3" defer></script>
+<script src="/js/comercial.js?v=3" defer></script>
+<script src="/js/clientes.js?v=3" defer></script>
+<script src="/js/financeiro.js?v=3" defer></script>
+<script src="/js/gestao.js?v=3" defer></script>
 </head>
 <body>
 <a class="skip" href="#content">Ir para o conteúdo</a>
@@ -39,6 +46,14 @@
     </header>
     <main id="content" tabindex="-1"></main>
   </div>
+  <div id="side-backdrop" class="side-backdrop" hidden></div>
+  <nav id="tabbar" class="tabbar" aria-label="Atalhos">
+    <a href="#/" data-tab="inicio"><span class="ico" data-ico="home"></span>Início</a>
+    <a href="#/prospeccao" data-tab="funil"><span class="ico" data-ico="funnel"></span>Funil</a>
+    <a href="#/financeiro" data-tab="financeiro"><span class="ico" data-ico="chart"></span>Financeiro</a>
+    <a href="#/pessoal" data-tab="pessoal"><span class="ico" data-ico="wallet"></span>Pessoal</a>
+    <button type="button" id="tab-menu" data-tab="menu"><span class="ico" data-ico="menu"></span>Menu</button>
+  </nav>
 </div>
 <section id="gate" class="gate">
   <div class="gate-mark">GRAVV</div>
