@@ -1,9 +1,8 @@
-"""API do CRM GRAVV online (Vercel + Supabase).
+"""API do CRM GRAVV online (Vercel + Supabase) — versão 2.
 
-Reaproveita o mesmo motor de eventos do CRM local (api/_lib/operacao.py). A diferença é
-onde o diário fica guardado: em vez de dados/estado.json, cada evento vira uma linha na
-tabela crm_eventos do Supabase. O estado é sempre reconstruído a partir do diário, com a
-mesma validação de hash usada no CRM local.
+Clientes, comercial (funil, follow-ups, vendas), projetos, financeiro (empresa e pessoal), MRR,
+leads do site e WhatsApp. Os dados ficam em tabelas do Supabase; as regras que mexem em dinheiro
+rodam dentro do banco (funções SQL atômicas). Esta API só autentica, confere e repassa.
 
 Variáveis de ambiente (configurar na Vercel, nunca no código):
   SUPABASE_URL          https://xxxx.supabase.co
@@ -15,7 +14,6 @@ Variáveis de ambiente (configurar na Vercel, nunca no código):
 """
 from __future__ import annotations
 
-from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 import hashlib
 import hmac
@@ -23,35 +21,69 @@ from http.cookies import CookieError, SimpleCookie
 from http.server import BaseHTTPRequestHandler
 import json
 import os
-from pathlib import Path
 import re
 import sys
 import traceback
 from urllib.error import HTTPError, URLError
-from urllib.parse import parse_qs, quote, urlsplit
+from urllib.parse import parse_qs, parse_qsl, quote, urlencode, urlsplit
 from urllib.request import Request, urlopen
 
-sys.path.insert(0, str(Path(__file__).resolve().parent / "_lib"))
-import operacao as motor  # noqa: E402
-
 BRASILIA = timezone(timedelta(hours=-3))  # Brasil sem horário de verão desde 2019.
-BUSINESS_COLLECTIONS = ('clientes', 'oportunidades', 'parcelas', 'pagamentos', 'despesas',
-                        'pagamentos_despesas', 'tarefas', 'projetos', 'notas')
-PERSONAL_COLLECTIONS = ('lancamentos_pessoais', 'movimentos_pessoais',
-                        'transferencias_internas', 'movimentos_transferencias')
-EVENT_TYPES = frozenset(('cliente.cadastrado', 'cliente.atualizado', 'oportunidade.criada',
-    'oportunidade.atualizada', 'proposta.aceita', 'contrato.assinado', 'pagamento.registrado',
-    'despesa.registrada', 'despesa.paga', 'pessoal.lancamento_registrado',
-    'pessoal.movimento_registrado', 'transferencia.prevista', 'transferencia.realizada',
-    'tarefa.criada', 'tarefa.atualizada', 'projeto.criado', 'projeto.atualizado', 'nota.registrada'))
 LEAD_STATUSES = frozenset(('novo', 'convertido', 'arquivado'))
 DEFAULT_SITE_ORIGINS = ('https://gravv-studios.vercel.app', 'https://gravv.com.br', 'https://www.gravv.com.br')
-PAGE = 1000
 MAX_BODY = 262144
-MAX_IMPORT = 4 * 1024 * 1024
 ACCESS_COOKIE = 'gravv_at'
 REFRESH_COOKIE = 'gravv_rt'
+UUID = re.compile(r'[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}')
 
+# Tabelas e visões que a tela pode ler.
+READ = frozenset((
+    'settings', 'clients', 'client_contacts', 'client_notes', 'services', 'pipeline_stages', 'leads', 'lead_activities',
+    'follow_ups', 'sales', 'sale_items', 'client_services', 'mrr_events', 'projects', 'project_tasks', 'financial_accounts',
+    'financial_categories', 'debts', 'financial_entries', 'financial_payments', 'recurring_billing_runs', 'goals', 'crm_leads',
+    'v_entries', 'v_payments', 'v_account_balances', 'v_client_mrr', 'v_mrr_summary', 'v_debts', 'v_leads', 'v_sales',
+    'v_projects', 'v_follow_ups', 'v_client_services', 'v_clients'))
+# O que pode ser gravado direto em cada tabela (o resto passa pelas funções do banco).
+PROTECTED = frozenset(('id', 'created_at', 'updated_at'))
+WRITE = {
+    'settings': {'upsert'},
+    'clients': {'insert', 'update'},
+    'client_contacts': {'insert', 'update', 'delete'},
+    'client_notes': {'insert', 'delete'},
+    'services': {'insert', 'update'},
+    'pipeline_stages': {'insert', 'update'},
+    'leads': {'insert', 'update', 'delete'},
+    'lead_activities': {'insert'},
+    'follow_ups': {'insert', 'update', 'delete'},
+    'sales': {'update'},
+    'client_services': {'insert', 'update'},
+    'projects': {'insert', 'update', 'delete'},
+    'project_tasks': {'insert', 'update', 'delete'},
+    'financial_accounts': {'insert', 'update'},
+    'financial_categories': {'insert', 'update'},
+    'debts': {'update'},
+    'financial_entries': {'insert', 'update'},
+    'goals': {'insert', 'update', 'delete'},
+    'crm_leads': {'update'},
+}
+# Campos que só as funções do banco mudam.
+LOCKED = {
+    'leads': {'stage_id', 'won_at', 'lost_at', 'lost_reason', 'converted_client_id', 'converted_sale_id'},
+    'financial_entries': {'paid_amount', 'sale_id', 'client_service_id', 'debt_id', 'billing_period'},
+    'sales': {'numero', 'client_id', 'lead_id', 'total', 'total_avulso', 'mrr_novo', 'parcelas', 'status', 'idempotency_key', 'cancelled_at'},
+    'client_services': {'mrr', 'sale_id'},
+    'debts': {'valor_parcela', 'total_parcelas', 'parcelas_pagas_antes', 'escopo'},
+    'projects': {'progress', 'completed_at'},
+    'follow_ups': {'completed_at'},
+    'crm_leads': {'nome', 'empresa', 'contato', 'interesse', 'mensagem', 'origem', 'ip_hash', 'criado_em'},
+}
+INSERT_ONLY_OK = {'leads': {'stage_id'}}  # na criação o lead nasce numa etapa
+RPC = frozenset(('move_lead', 'create_sale', 'cancel_sale', 'settle_entry', 'reverse_payment', 'quick_entry',
+                 'generate_recurring_billing', 'create_debt', 'create_recurring_expense', 'site_lead_to_pipeline'))
+BACKUP_TABLES = ('settings', 'clients', 'client_contacts', 'client_notes', 'services', 'pipeline_stages', 'leads', 'lead_activities',
+                 'follow_ups', 'sales', 'sale_items', 'client_services', 'mrr_events', 'projects', 'project_tasks',
+                 'financial_accounts', 'financial_categories', 'debts', 'financial_entries', 'financial_payments',
+                 'recurring_billing_runs', 'goals', 'crm_leads')
 
 class RequestError(Exception):
     def __init__(self, message, status=400):
@@ -126,80 +158,121 @@ def supabase(method, path, body=None, headers=None, user_token=None, raw_body=No
         raise RequestError('Banco online indisponível agora. Nada foi salvo; tente de novo em instantes.', 503)
 
 
-def load_rows():
-    rows, offset = [], 0
-    while True:
-        status, data = supabase('GET', f'/rest/v1/crm_eventos?select=posicao,id,hash,evento&order=posicao.asc&limit={PAGE}&offset={offset}')
-        if status != 200 or not isinstance(data, list):
-            raise RequestError('Não foi possível ler a base online. Confira se o SQL de criação foi executado no Supabase.', 503)
-        rows.extend(data)
-        if len(data) < PAGE:
-            return rows
-        offset += PAGE
+
+def unique_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise RequestError(f'Campo repetido no envio: {key}.')
+        result[key] = value
+    return result
 
 
-def build_state(rows):
-    """Mesma regra do load_state local: o estado nasce do diário e cada hash é conferido."""
-    state = motor.empty_state()
-    for position, row in enumerate(rows):
-        motor.require(row.get('posicao') == position, 'Diário online com lacuna de posição. Preserve a base para revisão.')
-        event = row.get('evento')
-        motor.validate_event(event)
-        motor.require(event['id'] == row.get('id') and row.get('hash') == motor.fingerprint(event),
-                      'Diário de eventos inconsistente.')
-        motor.process(state, event)
-        state['eventos'][event['id']] = {'hash': row['hash'], 'evento': event}
-    return state
+def db_error(status, payload, fallback='O banco recusou a operação.'):
+    message = (payload or {}).get('message') if isinstance(payload, dict) else ''
+    code = (payload or {}).get('code') if isinstance(payload, dict) else ''
+    if code == 'P0001' and message:
+        return RequestError(message, 400)  # regra de negócio escrita no banco, já em português
+    if code == '23505':
+        return RequestError('Esse registro já existe.', 409)
+    if code == '23503':
+        return RequestError('Esse registro está ligado a outros e não pode ser removido. Arquive em vez de apagar.', 409)
+    if code in ('23514', '22P02', '22007', '22008', '23502', '22003', '42703'):
+        return RequestError('Algum campo está vazio ou num formato inválido. Confira o formulário.', 400)
+    return RequestError(fallback, 503 if status >= 500 else 400)
 
 
-def load_state():
-    return build_state(load_rows())
+def check_table(table, action=None):
+    if table not in READ:
+        raise RequestError('Tabela não encontrada.', 404)
+    if action and action not in WRITE.get(table, ()):
+        raise RequestError('Essa alteração não é permitida por aqui.', 403)
 
 
-def apply_event(event):
-    motor.validate_event(event)
-    digest = motor.fingerprint(event)
-    rows = load_rows()
-    state = build_state(rows)
-    previous = state['eventos'].get(event['id'])
-    if previous:
-        motor.require(previous['hash'] == digest, f"Conflito: evento {event['id']} já existe com outro conteúdo.")
-        return {'status': 'repetido_sem_alteracao', 'evento_id': event['id']}
-    working = deepcopy(state)
-    motor.process(working, event)  # valida tudo antes de gravar
-    status, _ = supabase('POST', '/rest/v1/crm_eventos',
-                         [{'posicao': len(rows), 'id': event['id'], 'hash': digest, 'evento': event}],
-                         headers={'Prefer': 'return=minimal'})
-    if status == 409:
-        raise RequestError('Outra alteração foi salva ao mesmo tempo. Atualize a página e tente de novo.', 409)
-    if status not in (200, 201, 204):
-        raise RequestError('O banco online recusou a gravação. Nada foi confirmado.', 503)
-    return {'status': 'aplicado', 'evento_id': event['id'], 'tipo': event['tipo']}
+def clean_row(table, data, inserting):
+    if not isinstance(data, dict) or not data:
+        raise RequestError('Envio sem campos.')
+    blocked = PROTECTED | LOCKED.get(table, set())
+    if inserting:
+        blocked = blocked - INSERT_ONLY_OK.get(table, set())
+    row = {}
+    for key, value in data.items():
+        if not isinstance(key, str) or not re.fullmatch(r'[a-z_]{1,40}', key):
+            raise RequestError('Campo inválido.')
+        if key in blocked:
+            continue
+        if isinstance(value, str):
+            value = CONTROL.sub('', value).strip()
+            value = value if value != '' else None
+        row[key] = value
+    if not row:
+        raise RequestError('Nada para salvar.')
+    return row
 
 
-def import_state(state):
-    """Importa o estado.json / backup do CRM local, só com a base online vazia."""
-    motor.obj(state, 'backup')
-    motor.require(isinstance(state.get('eventos'), dict), 'Arquivo não parece um backup do CRM GRAVV.')
-    records = list(state['eventos'].items())
-    rows = []
-    for position, (event_id, record) in enumerate(records):
-        motor.fields(record, ['hash', 'evento'], label=f'evento {event_id}')
-        rows.append({'posicao': position, 'id': event_id, 'hash': record['hash'], 'evento': record['evento']})
-    rebuilt = build_state(rows)  # confere hash e regras de todos os eventos
-    for name in motor.COLLECTIONS:
-        if name in state and name != 'eventos':
-            motor.require(rebuilt[name] == state[name], 'O backup não corresponde ao seu diário de eventos. Nada foi importado.')
-    if load_rows():
-        raise RequestError('A base online já tem registros. A importação só é feita numa base vazia.', 409)
-    if not rows:
-        return {'status': 'vazio', 'eventos': 0}
-    status, _ = supabase('POST', '/rest/v1/crm_eventos', rows, headers={'Prefer': 'return=minimal'})
-    if status == 409:
-        raise RequestError('A base online recebeu registros durante a importação. Nada foi duplicado; confira antes de repetir.', 409)
-    if status not in (200, 201, 204):
-        raise RequestError('O banco online recusou a importação. Nada foi confirmado.', 503)
-    return {'status': 'importado', 'eventos': len(rows)}
+def db_read(table, query):
+    check_table(table)
+    params = [(k, v) for k, v in parse_qsl(query, keep_blank_values=True) if k != 'rota']
+    if not any(k == 'limit' for k, _ in params):
+        params.append(('limit', '5000'))
+    status, data = supabase('GET', f'/rest/v1/{table}?' + urlencode(params, safe='(),.*:'))
+    if status != 200:
+        raise db_error(status, data, 'Não foi possível ler os dados.')
+    return data
+
+
+def row_id(query):
+    rid = dict(parse_qsl(query)).get('id', '')
+    if not UUID.fullmatch(rid):
+        raise RequestError('Registro inválido.')
+    return rid
+
+
+def db_write(method, table, query, data):
+    if method == 'POST':
+        if 'upsert' in WRITE.get(table, ()):
+            if not isinstance(data, dict) or not re.fullmatch(r'[a-z_]{1,60}', str(data.get('key', ''))) or 'value' not in data:
+                raise RequestError('Configuração inválida.')
+            status, rows = supabase('POST', f'/rest/v1/{table}?on_conflict=key', [{'key': data['key'], 'value': data['value']}],
+                                    headers={'Prefer': 'resolution=merge-duplicates,return=representation'})
+        else:
+            check_table(table, 'insert')
+            status, rows = supabase('POST', f'/rest/v1/{table}', [clean_row(table, data, True)],
+                                    headers={'Prefer': 'return=representation'})
+        if status not in (200, 201):
+            raise db_error(status, rows, 'Não foi possível salvar.')
+        return rows[0] if isinstance(rows, list) and rows else {}
+    rid = row_id(query)
+    if method == 'PATCH':
+        check_table(table, 'update')
+        status, rows = supabase('PATCH', f'/rest/v1/{table}?id=eq.{rid}', clean_row(table, data, False),
+                                headers={'Prefer': 'return=representation'})
+        if status != 200:
+            raise db_error(status, rows, 'Não foi possível salvar.')
+        if not rows:
+            raise RequestError('Registro não encontrado.', 404)
+        return rows[0]
+    check_table(table, 'delete')
+    status, rows = supabase('DELETE', f'/rest/v1/{table}?id=eq.{rid}', headers={'Prefer': 'return=representation'})
+    if status != 200:
+        raise db_error(status, rows, 'Não foi possível apagar.')
+    return {'ok': True, 'removidos': len(rows or [])}
+
+
+def db_rpc(name, data):
+    if name not in RPC:
+        raise RequestError('Operação não encontrada.', 404)
+    if not isinstance(data, dict):
+        raise RequestError('Envio inválido.')
+    status, result = supabase('POST', f'/rest/v1/rpc/{name}', data)
+    if status not in (200, 201):
+        raise db_error(status, result, 'Não foi possível concluir a operação.')
+    return result
+
+
+def backup():
+    return {'gerado_em': datetime.now(timezone.utc).isoformat(), 'app': 'gravv-crm', 'versao': 2,
+            'tabelas': {name: db_read(name, 'limit=100000') for name in BACKUP_TABLES}}
 
 
 # --------------------------------------------------------------------------- Leads
@@ -246,29 +319,6 @@ def save_lead(data, ip):
     status, _ = supabase('POST', '/rest/v1/crm_leads', [{**lead, 'ip_hash': ip_hash}], headers={'Prefer': 'return=minimal'})
     if status not in (200, 201, 204):
         raise RequestError('Não conseguimos registrar agora. Chame a gente no Instagram @gravv.studio.', 503)
-    return {'ok': True}
-
-
-def list_leads():
-    status, data = supabase('GET', '/rest/v1/crm_leads?select=id,criado_em,nome,empresa,contato,interesse,mensagem,origem,status,cliente_id&order=criado_em.desc&limit=500')
-    if status != 200 or not isinstance(data, list):
-        raise RequestError('Não foi possível ler os leads do site.', 503)
-    return data
-
-
-def update_lead(data):
-    motor.fields(data, ['id', 'status'], ['cliente_id'], label='lead')
-    if not isinstance(data['id'], str) or not re.fullmatch(r'[0-9a-fA-F-]{36}', data['id']):
-        raise RequestError('Lead inválido.')
-    if data['status'] not in LEAD_STATUSES:
-        raise RequestError('Situação de lead inválida.')
-    patch = {'status': data['status'], 'atualizado_em': datetime.now(timezone.utc).isoformat()}
-    if 'cliente_id' in data:
-        motor.identifier(data['cliente_id'], 'cliente_id')
-        patch['cliente_id'] = data['cliente_id']
-    status, rows = supabase('PATCH', f"/rest/v1/crm_leads?id=eq.{data['id']}", patch, headers={'Prefer': 'return=representation'})
-    if status != 200 or not rows:
-        raise RequestError('Lead não encontrado.', 404)
     return {'ok': True}
 
 
@@ -399,7 +449,8 @@ def graph(method, path, body=None):
 
 
 def wa_send(data):
-    motor.fields(data, ['telefone', 'texto'], label='mensagem')
+    if set(data) != {'telefone', 'texto'}:
+        raise RequestError('Envie telefone e texto.')
     phone = re.sub(r'\D', '', str(data['telefone']))
     text = clean(data['texto'], 'mensagem', 4000, True)
     if not 10 <= len(phone) <= 15:
@@ -538,7 +589,7 @@ class handler(BaseHTTPRequestHandler):  # nome exigido pelo runtime Python da Ve
             raise RequestError('Formato de envio não aceito.', 415)
         raw = self._raw_body(limit)
         try:
-            data = json.loads(raw.decode('utf-8-sig'), object_pairs_hook=motor.unique_object,
+            data = json.loads(raw.decode('utf-8-sig'), object_pairs_hook=unique_object,
                               parse_constant=lambda _: (_ for _ in ()).throw(RequestError('Valor numérico inválido.')))
         except (ValueError, UnicodeError, RecursionError):
             raise RequestError('Envio inválido. Confira o formulário.')
@@ -648,16 +699,18 @@ class handler(BaseHTTPRequestHandler):  # nome exigido pelo runtime Python da Ve
                 try:
                     banco, _ = supabase('GET', '/rest/v1/crm_leads?select=id&limit=1')
                     auth, _ = supabase('GET', '/auth/v1/settings')
-                    info.update(banco_status=banco, auth_status=auth)
+                    v2, _ = supabase('GET', '/rest/v1/pipeline_stages?select=id&limit=1')
+                    info.update(banco_status=banco, auth_status=auth, crm_v2=v2 == 200)
                 except RequestError as exc:
                     info.update(banco_status=str(exc))
             self._reply(200, info)
             return
-        post = method == 'POST'
-        self._boundary(mutate=post)
-        if post and path == '/api/login':
+        mutate = method in ('POST', 'PATCH', 'DELETE')
+        self._boundary(mutate=mutate)
+        if method == 'POST' and path == '/api/login':
             data = self._json()
-            motor.fields(data, ['email', 'password'], label='login')
+            if set(data) != {'email', 'password'} or not isinstance(data['password'], str):
+                raise RequestError('Informe e-mail e senha.')
             email = clean(data['email'], 'e-mail', 200, True).lower()
             if email not in owners():
                 raise RequestError('E-mail ou senha incorretos.', 401)
@@ -667,47 +720,42 @@ class handler(BaseHTTPRequestHandler):  # nome exigido pelo runtime Python da Ve
             self._set_session_cookies(tokens)
             self._reply(200, {'ok': True})
             return
-        if post and path == '/api/logout':
+        if method == 'POST' and path == '/api/logout':
             self._clear_session_cookies()
             self._reply(200, {'ok': True})
             return
-        session = self._session(mutate=post)
-        if post:
-            if path == '/api/events':
-                event = self._json()
-                if event.get('tipo') not in EVENT_TYPES:
-                    raise RequestError('Ação não disponível neste CRM.')
-                self._reply(200, {'ok': True, 'result': apply_event(event)})
-            elif path == '/api/import':
-                self._reply(200, {'ok': True, 'result': import_state(self._json(MAX_IMPORT))})
-            elif path == '/api/leads/status':
-                self._reply(200, update_lead(self._json()))
-            elif path == '/api/conversas/enviar':
+        session = self._session(mutate=mutate)
+        query = urlsplit(self.path).query
+        if path.startswith('/api/db/'):
+            table = path[len('/api/db/'):]
+            if method == 'GET':
+                self._reply(200, db_read(table, query))
+            else:
+                check_table(table)
+                self._reply(200, db_write(method, table, query, self._json() if method != 'DELETE' else None))
+            return
+        if path.startswith('/api/rpc/') and method == 'POST':
+            self._reply(200, {'ok': True, 'result': db_rpc(path[len('/api/rpc/'):], self._json())})
+            return
+        if method == 'POST':
+            if path == '/api/conversas/enviar':
                 self._reply(200, wa_send(self._json()))
             elif path == '/api/conversas/assinar':
                 self._reply(200, wa_subscribe())
             else:
                 raise RequestError('Ação não encontrada.', 404)
             return
+        if method != 'GET':
+            raise RequestError('Método não aceito.', 405)
         if path == '/api/session':
             self._reply(200, {'authenticated': True, 'csrf': session['csrf'], 'today': today(),
-                              'owner': env('OWNER_NAME', 'Marcos'), 'email': session['email']})
-        elif path in ('/api/state', '/api/personal'):
-            state = load_state()
-            personal = path == '/api/personal'
-            collections = PERSONAL_COLLECTIONS if personal else BUSINESS_COLLECTIONS
-            self._reply(200, {'state': {name: state.get(name, {}) for name in collections},
-                              'financeiro': motor.finance_summary(state, today(), 'consolidado' if personal else 'empresa'),
-                              'today': today(), 'revision': len(state['eventos'])})
+                              'owner': env('OWNER_NAME', 'Marcos'), 'email': session['email'],
+                              'owners': sorted(owners())})
         elif path == '/api/backup':
-            self._reply(200, motor.json_text(load_state()), 'application/json; charset=utf-8',
-                        {'Content-Disposition': f'attachment; filename="gravv-privado-{today()}.json"'})
-        elif path == '/api/leads':
-            self._reply(200, {'leads': list_leads()})
+            self._reply(200, json.dumps(backup(), ensure_ascii=False, indent=1), 'application/json; charset=utf-8',
+                        {'Content-Disposition': f'attachment; filename="gravv-crm-backup-{today()}.json"'})
         elif path == '/api/conversas':
             self._reply(200, {'mensagens': wa_list(), 'configuracao': wa_configured()})
-        elif path == '/api/documents':
-            self._reply(200, {'documents': []})  # contratos continuam só na pasta privada do computador
         else:
             raise RequestError('Página não encontrada.', 404)
 
@@ -722,9 +770,6 @@ class handler(BaseHTTPRequestHandler):  # nome exigido pelo runtime Python da Ve
             if exc.status == 401 and self._route() != '/api/login':
                 self._clear_session_cookies()
             self._reply(exc.status, {'error': str(exc)}, extra=extra)
-        except motor.OperationError as exc:
-            message = str(exc)
-            self._reply(409 if 'Conflito:' in message else 400, {'error': message})
         except Exception:
             traceback.print_exc(file=sys.stderr)  # só a pilha técnica; nunca corpo, token ou contato
             self._reply(500, {'error': 'Não foi possível concluir. Seus dados existentes foram preservados.'})
@@ -737,6 +782,12 @@ class handler(BaseHTTPRequestHandler):  # nome exigido pelo runtime Python da Ve
 
     def do_POST(self):
         self._safe('POST')
+
+    def do_PATCH(self):
+        self._safe('PATCH')
+
+    def do_DELETE(self):
+        self._safe('DELETE')
 
     def do_OPTIONS(self):
         self._safe('OPTIONS')
