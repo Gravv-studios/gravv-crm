@@ -57,20 +57,45 @@ async function api(path, { method = 'GET', body } = {}) {
   if (!r.ok) throw Error((data && data.error) || 'Não foi possível concluir.');
   return data;
 }
+// Leituras juntadas: tudo que a tela pede no mesmo instante vai numa chamada só (/api/batch).
+let BATCH = null, BATCH_TIMER = 0;
+function flushBatch() {
+  clearTimeout(BATCH_TIMER);
+  const items = BATCH; BATCH = null;
+  if (!items || !items.length) return;
+  if (items.length === 1) {
+    const [it] = items;
+    api(`/api/db/${it.t}${it.q ? '?' + it.q : ''}`).then(it.ok, it.no);
+    return;
+  }
+  api('/api/batch?q=' + encodeURIComponent(JSON.stringify(items.map(it => [it.t, it.q])))).then(
+    res => res.results.forEach((r, i) => ('error' in r ? items[i].no(Error(r.error)) : items[i].ok(r.data))),
+    err => items.forEach(it => it.no(err)));
+}
+function batchGet(t, q) {
+  return new Promise((ok, no) => {
+    if (!BATCH) { BATCH = []; BATCH_TIMER = setTimeout(flushBatch, 4); }
+    BATCH.push({ t, q, ok, no });
+    if (BATCH.length >= 24) flushBatch();
+  });
+}
 const db = {
-  get: (t, q = '') => api(`/api/db/${t}${q ? '?' + q : ''}`),
+  get: (t, q = '') => batchGet(t, q),
   add: (t, row) => api(`/api/db/${t}`, { method: 'POST', body: row }),
   set: (t, id, row) => api(`/api/db/${t}?id=${encodeURIComponent(id)}`, { method: 'PATCH', body: row }),
   del: (t, id) => api(`/api/db/${t}?id=${encodeURIComponent(id)}`, { method: 'DELETE' }),
 };
 const rpc = async (name, body) => (await api('/api/rpc/' + name, { method: 'POST', body })).result;
 
+function setRef({ stages, categories, accounts, services, clients, settings }) {
+  Object.assign(REF, { stages, categories, accounts, services, clients, settings: Object.fromEntries(settings.map(s => [s.key, s.value])) });
+}
 async function loadRef() {
   const [stages, categories, accounts, services, clients, settings] = await Promise.all([
     db.get('pipeline_stages', 'order=posicao.asc'), db.get('financial_categories', 'order=nome.asc'),
     db.get('v_account_balances', 'order=nome.asc'), db.get('services', 'order=nome.asc'),
     db.get('clients', 'select=id,nome,status,telefone,email&order=nome.asc'), db.get('settings')]);
-  Object.assign(REF, { stages, categories, accounts, services, clients, settings: Object.fromEntries(settings.map(s => [s.key, s.value])) });
+  setRef({ stages, categories, accounts, services, clients, settings });
 }
 const clientName = id => REF.clients.find(c => c.id === id)?.nome || '—';
 const catOptions = (tipo, escopo) => REF.categories.filter(c => c.ativo && (!tipo || c.tipo === tipo) && (!escopo || c.escopo === escopo)).map(c => [c.id, c.nome]);
@@ -87,7 +112,7 @@ const ICONS = {
   flow: 'M3 12h4l3-8 4 16 3-8h4', minus: 'M4 12h16M6 6h12l-1 14H7z', repeat: 'M17 2l4 4-4 4M3 12V10a4 4 0 0 1 4-4h14M7 22l-4-4 4-4M21 12v2a4 4 0 0 1-4 4H3',
   wallet: 'M3 7a2 2 0 0 1 2-2h14v4M3 7v10a2 2 0 0 0 2 2h16v-10H5a2 2 0 0 1-2-2zM16 14h.01', report: 'M6 3h9l5 5v13H6zM14 3v6h6M9 13h8M9 17h8',
   inbox: 'M3 13l3-8h12l3 8v6H3zM3 13h5l1 2h6l1-2h5', chat: 'M21 12a8 8 0 0 1-11.6 7.1L4 20l1-4.6A8 8 0 1 1 21 12z', gear: 'M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6zM19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-2.8 1.2V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-2.8-1.2l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1A1.7 1.7 0 0 0 3.2 14H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.2-2.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1A1.7 1.7 0 0 0 10 3.2V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 2.8 1.2l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0 1.2 2.8H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1.1z',
-  bell: 'M6 8a6 6 0 1 1 12 0c0 7 3 9 3 9H3s3-2 3-9M10.3 21a1.9 1.9 0 0 0 3.4 0', user: 'M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2M12 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8z',
+  menu: 'M4 6h16M4 12h16M4 18h16', bell: 'M6 8a6 6 0 1 1 12 0c0 7 3 9 3 9H3s3-2 3-9M10.3 21a1.9 1.9 0 0 0 3.4 0', user: 'M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2M12 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8z',
 };
 const ico = name => `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="${ICONS[name] || ''}"/></svg>`;
 const btn = (text, action, data = {}, cls = '') => `<button type="button" class="${cls}" data-action="${action}" ${Object.entries(data).map(([k, v]) => `data-${k}="${esc(v)}"`).join(' ')}>${esc(text)}</button>`;
@@ -217,9 +242,17 @@ const NAV = [
   ['Gestão', [['relatorios', 'Relatórios', 'report', '#/relatorios']]],
 ];
 let CURRENT = { nav: '', path: '', query: new URLSearchParams() };
+const TAB_OF = { dashboard: 'inicio', prospeccao: 'funil', 'follow-ups': 'funil', vendas: 'funil', 'leads-site': 'funil',
+  financeiro: 'financeiro', receber: 'financeiro', pagar: 'financeiro', fluxo: 'financeiro', despesas: 'financeiro', mrr: 'financeiro', pessoal: 'pessoal' };
+function setMenu(open) {
+  $('#sidebar').classList.toggle('open', open); $('#side-backdrop').hidden = !open;
+  $('#menu-toggle').setAttribute('aria-expanded', String(open)); document.body.classList.toggle('locked', open);
+}
 function renderNav() {
   $('#nav').innerHTML = NAV.map(([sec, items]) => `${sec ? `<div class="nav-sec">${esc(sec)}</div>` : ''}${items.map(([k, t, i, h]) => `<a href="${h}" class="nav-link ${CURRENT.nav === k ? 'on' : ''}" data-nav="${k}" ${CURRENT.nav === k ? 'aria-current="page"' : ''}><span class="ico">${ico(i)}</span>${esc(t)}</a>`).join('')}`).join('');
   $$('.side-foot .nav-link').forEach(a => a.classList.toggle('on', a.dataset.nav === CURRENT.nav));
+  const tab = TAB_OF[CURRENT.nav] || 'menu';
+  $$('#tabbar [data-tab]').forEach(a => { const on = a.dataset.tab === tab; a.classList.toggle('on', on); on ? a.setAttribute('aria-current', 'page') : a.removeAttribute('aria-current'); });
   $$('[data-ico]').forEach(i => { if (!i.innerHTML) i.innerHTML = ico(i.dataset.ico); });
 }
 function parseHash() {
@@ -232,7 +265,9 @@ function setQuery(changes) {
   for (const [k, v] of Object.entries(changes)) (v == null || v === '' ? query.delete(k) : query.set(k, v));
   const qs = query.toString(); location.hash = '#' + path + (qs ? '?' + qs : '');
 }
+let RENDER_SEQ = 0;
 async function render() {
+  const seq = ++RENDER_SEQ;
   const { path, query } = parseHash();
   const r = ROUTES.find(x => x.re.test(path)) || ROUTES.find(x => x.nav === 'dashboard');
   const params = path.match(r.re)?.slice(1) || [];
@@ -242,17 +277,26 @@ async function render() {
   document.title = `${r.title} · GRAVV CRM`;
   const main = $('#content');
   if (!main.innerHTML) main.innerHTML = '<div class="loading">Carregando…</div>';
-  main.classList.add('busy');
+  main.classList.add('busy'); document.body.classList.add('loading');
+  refreshBell(); // entra no mesmo lote das consultas da tela
   try {
     const out = await r.fn(query, ...params);
+    if (seq !== RENDER_SEQ) return; // o usuário já foi para outra tela
     const page = typeof out === 'string' ? { html: out } : out;
     if (page.title) { $('#page-title').textContent = page.title; document.title = `${page.title} · GRAVV CRM`; }
     main.innerHTML = page.html;
+    labelTables(main);
     page.after && page.after(main);
   } catch (e) {
-    if (e.message !== 'Sessão encerrada.') main.innerHTML = `<div class="empty"><strong>Não carregou.</strong><p>${esc(e.message)}</p>${btn('Tentar de novo', 'reload', {}, 'primary')}</div>`;
-  } finally { main.classList.remove('busy'); }
-  refreshBell();
+    if (seq === RENDER_SEQ && e.message !== 'Sessão encerrada.') main.innerHTML = `<div class="empty"><strong>Não carregou.</strong><p>${esc(e.message)}</p>${btn('Tentar de novo', 'reload', {}, 'primary')}</div>`;
+  } finally { if (seq === RENDER_SEQ) { main.classList.remove('busy'); document.body.classList.remove('loading'); } }
+}
+// No celular as tabelas viram cartões: cada célula ganha o nome da coluna.
+function labelTables(root) {
+  $$('.table-wrap table', root).forEach(t => {
+    const heads = $$('thead th', t).map(th => th.textContent.trim());
+    $$('tbody tr', t).forEach(tr => [...tr.children].forEach((td, i) => { if (heads[i] && !td.hasAttribute('data-label')) td.setAttribute('data-label', heads[i]); }));
+  });
 }
 const rerender = () => render();
 async function saved(msg = 'Salvo.') { closeSheet(); toast(msg); await loadRef().catch(() => {}); await render(); }
@@ -276,11 +320,11 @@ function enableDnD(root, onDrop) {
 async function boot() {
   $('#retry').hidden = true; $('#login-form').hidden = true; $('#gate-title').textContent = 'Abrindo o CRM…'; $('#gate-message').textContent = '';
   try {
-    const r = await fetch('/api/session', { credentials: 'same-origin' });
+    const r = await fetch('/api/session?ref=1', { credentials: 'same-origin' });
     if (r.status === 401 || r.status === 403) return showLogin(r.status === 403 ? 'Este e-mail não tem acesso ao CRM.' : '');
     const s = await r.json(); if (!r.ok) throw Error(s.error || 'Não foi possível abrir o CRM.');
     Object.assign(S, { csrf: s.csrf, today: s.today, owner: s.owner, email: s.email, owners: s.owners || [] });
-    await loadRef();
+    if (s.ref) setRef(s.ref); else await loadRef();
     $('#gate').hidden = true; $('#shell').hidden = false;
     await render();
   } catch (e) { $('#gate-title').textContent = 'Não foi possível abrir o CRM.'; $('#gate-message').textContent = e.message; $('#retry').hidden = false; }
@@ -320,6 +364,7 @@ async function globalSearch(q) {
 // ---------------------------------------------------------------- eventos globais
 document.addEventListener('click', async e => {
   if (e.target.closest('[data-close]')) { e.preventDefault(); closeSheet(); return; }
+  if (e.target.closest('#sidebar a')) setMenu(false);
   if (!e.target.closest('.dropdown, #bell, #new-btn, #global-search')) $$('.dropdown').forEach(d => (d.hidden = true));
   if (e.target.closest('.dropdown a')) $$('.dropdown').forEach(d => (d.hidden = true));
   const el = e.target.closest('[data-action]'); if (!el) return;
@@ -335,19 +380,21 @@ $('#sheet-form').addEventListener('submit', async e => {
   try { await SHEET.onSubmit(readForm(SHEET.fields)); } catch (err) { $('#sheet-error').textContent = err.message; } finally { if (b.isConnected) b.disabled = false; }
 });
 $('#sheet-backdrop').addEventListener('click', closeSheet);
-document.addEventListener('keydown', e => { if (e.key === 'Escape') { if (SHEET) closeSheet(); $$('.dropdown').forEach(d => (d.hidden = true)); } });
+document.addEventListener('keydown', e => { if (e.key === 'Escape') { if (SHEET) closeSheet(); setMenu(false); $$('.dropdown').forEach(d => (d.hidden = true)); } });
 $('#login-form').addEventListener('submit', async e => {
   e.preventDefault(); const b = $('#login-button'); b.disabled = true; $('#login-error').textContent = '';
   try { await api('/api/login', { method: 'POST', body: { email: $('#login-email').value.trim(), password: $('#login-password').value } }); $('#login-password').value = ''; await boot(); }
   catch (err) { $('#login-error').textContent = err.message; } finally { b.disabled = false; }
 });
 $('#retry').addEventListener('click', boot);
-$('#menu-toggle').addEventListener('click', () => { const open = $('#sidebar').classList.toggle('open'); $('#menu-toggle').setAttribute('aria-expanded', String(open)); });
+$('#menu-toggle').addEventListener('click', () => setMenu(!$('#sidebar').classList.contains('open')));
+$('#side-backdrop').addEventListener('click', () => setMenu(false));
+$('#tab-menu').addEventListener('click', () => setMenu(!$('#sidebar').classList.contains('open')));
 $('#bell').addEventListener('click', () => toggleMenu('bell-menu'));
 $('#new-btn').addEventListener('click', () => { $('#new-menu').innerHTML = NEW_MENU.map(([t, a]) => `<button type="button" data-action="${a}">${esc(t)}</button>`).join(''); toggleMenu('new-menu'); });
 $('#global-search').addEventListener('input', e => { clearTimeout(searchTimer); searchTimer = setTimeout(() => globalSearch(e.target.value.trim()).catch(() => {}), 250); });
 $('#global-search').addEventListener('focus', e => e.target.value.trim().length > 1 && ($('#search-results').hidden = false));
-window.addEventListener('hashchange', () => { if (SHEET) closeSheet(); $('#sidebar').classList.remove('open'); $('#global-search').value = ''; $('#search-results').hidden = true; render(); });
+window.addEventListener('hashchange', () => { if (SHEET) closeSheet(); setMenu(false); window.scrollTo(0, 0); $('#global-search').value = ''; $('#search-results').hidden = true; render(); });
 
 ACTIONS.reload = () => render();
 ACTIONS.logout = async () => { await api('/api/logout', { method: 'POST' }); location.hash = ''; location.reload(); };
