@@ -16,6 +16,15 @@
   ],
   "headers": [
     {
+      "source": "/(js/.*|styles.css|logo.png|icon-.*|apple-touch-icon.png|favicon.svg)",
+      "headers": [
+        {
+          "key": "Cache-Control",
+          "value": "public, max-age=86400, stale-while-revalidate=604800"
+        }
+      ]
+    },
+    {
       "source": "/(.*)",
       "headers": [
         {
@@ -44,5 +53,8 @@
         }
       ]
     }
+  ],
+  "regions": [
+    "gru1"
   ]
 }
