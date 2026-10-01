@@ -235,3 +235,37 @@ route('/pessoal', 'Minhas finanças', async () => {
         <footer>${g.tipo !== 'quitar' && g.status === 'ativa' ? btn('Guardar', 'goal-add', { id: g.id }, 'small primary') : ''}${btn('Editar', 'edit-goal', { id: g.id }, 'small')}${btn('✕', 'del-goal', { id: g.id }, 'small subtle')}</footer></article>`; }).join('')}</div>` : empty('Nenhuma meta', 'Ex.: quitar o carro, reserva de emergência, juntar para um equipamento.', 'new-goal', '+ Criar meta'), goals.length ? btn('+ Meta', 'new-goal', {}, 'small') : '')
     + `<div class="grid-2">${panel('Próximos vencimentos (30 dias)', entryTable(open.filter(e => e.due_date <= addDays(S.today, 30)), { client: false }))}${panel('Gastos do mês por categoria', hbars(cats))}</div>`;
 }, 'pessoal');
+
+// ---------------------------------------------------------------- Agente financeiro (IA): quanto posso gastar + conversa
+const AGT = { data: null };
+route('/agente', 'Agente financeiro', async () => {
+  let r; try { r = await api('/api/agente'); } catch (e) { return `<div class="notice bad">${esc(e.message)}</div>`; }
+  AGT.data = r; const s = r.resumo || {}; const c = r.config || {};
+  const notes = [!c.ia ? `<div class="notice">Para conversar, falta a <b>ANTHROPIC_API_KEY</b> na Vercel (chave da API da Anthropic). Os números abaixo já funcionam.</div>` : '',
+    !c.whatsapp ? `<div class="notice">O bot no WhatsApp liga quando o <b>WHATSAPP_TOKEN</b> estiver na Vercel. Até lá, converse por aqui.</div>` : '',
+    c.whatsapp && !c.telefone_dono ? `<div class="notice">Coloque <b>seu WhatsApp pessoal</b> em Ajustes: só esse número conversa com o agente.</div>` : ''].join('');
+  const tone = s.livre_por_dia < 15 ? 'bad' : s.livre_por_dia < 35 ? 'warn' : 'good';
+  const cards = kpis([kpi('Saldo no banco', money(s.saldo_no_banco)),
+    kpi('Livre pra gastar', money(s.livre_para_gastar), `até ${fdate(s.ate)} · dia mais apertado ${fdate(s.dia_mais_apertado)}`, tone),
+    kpi('Por dia', money(s.livre_por_dia), `${s.dias_no_periodo} dias no período`, tone),
+    kpi(`Próximo mês (${s.proximo_mes?.mes || ''})`, money(s.proximo_mes?.resultado), `entra ${money(s.proximo_mes?.entradas_previstas)} · sai ${money(s.proximo_mes?.saidas_previstas)}`, (s.proximo_mes?.resultado || 0) < 0 ? 'bad' : '')]);
+  const gastosHTML = hbars(Object.entries(s.gastos_do_mes_por_categoria || {}));
+  const comp = (s.compromissos || []).map(x => `<tr><td data-label="Vence">${fdate(x.vence)}${x.atrasado ? ' ' + badge('Atrasado', 'bad') : ''}</td><td data-label="O quê">${esc(x.descricao)}${x.cliente ? `<small>${esc(x.cliente)}</small>` : ''}</td><td class="r" data-label="Valor"><span class="${x.tipo === 'receber' ? 'good-text' : ''}">${x.tipo === 'receber' ? '+' : '−'} ${money(x.valor)}</span></td></tr>`);
+  const msgs = (r.mensagens || []).map(m => `<div class="bubble ${m.papel === 'dono' ? 'out' : 'in'}"><p>${esc(m.texto)}</p><small>${fdt(m.created_at)}${m.canal === 'whatsapp' ? ' · WhatsApp' : ''}</small></div>`).join('');
+  const chat = `<section class="panel"><header class="panel-head"><h2>Converse com o agente</h2><div class="panel-aside">${btn('Ajustes', 'agt-config', {}, 'small subtle')}</div></header>
+    <div class="chat-thread" id="agt-thread">${msgs || '<p class="muted">Ex.: "gastei 32 no almoço", "paguei a faculdade", "o Hugo pagou", "quanto posso gastar hoje?"</p>'}</div>
+    <div class="chat-compose"><textarea id="agt-text" rows="2" placeholder="Fale com o agente…" aria-label="Mensagem para o agente" ${c.ia ? '' : 'disabled'}></textarea>${btn('Enviar', 'agt-send', {}, 'primary')}</div></section>`;
+  return { html: notes + cards + chat + `<div class="grid-2">${panel('Gastos do mês por categoria', gastosHTML, money(s.total_gasto_no_mes))}${panel('Compromissos até o fim do período', table(['Vence', 'O quê', ['Valor', 'r']], comp, 'Nada pendente.'))}</div>`,
+    after: root => { const t = $('#agt-thread', root); if (t) t.scrollTop = t.scrollHeight; const ta = $('#agt-text', root); if (ta) ta.addEventListener('keydown', e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); ACTIONS['agt-send'](); } }); } };
+}, 'agente');
+ACTIONS['agt-send'] = async () => {
+  const ta = $('#agt-text'); const t = ta?.value.trim(); if (!t || ta.disabled) return;
+  const th = $('#agt-thread'); th.insertAdjacentHTML('beforeend', `<div class="bubble out"><p>${esc(t)}</p></div><div class="bubble in" id="agt-wait"><p>…</p></div>`); th.scrollTop = th.scrollHeight;
+  ta.value = ''; ta.disabled = true;
+  try { const r = await api('/api/agente/chat', { method: 'POST', body: { texto: t } }); if (r.acoes?.length) await loadRef().catch(() => {}); await render(); }
+  catch (e) { $('#agt-wait')?.remove(); toast(e.message, 'bad'); ta.disabled = false; ta.value = t; }
+};
+ACTIONS['agt-config'] = () => { const c = AGT.data?.config || {};
+  openSheet({ title: 'Ajustes do agente', values: { telefone_dono: c.telefone_dono || '' }, html: `<p class="muted">Modelo de IA: ${esc(c.modelo || '')}. Só o número abaixo conversa com o agente pelo WhatsApp da GRAVV.</p>`,
+    fields: [{ name: 'telefone_dono', label: 'Seu WhatsApp pessoal (com DDD)', required: true, placeholder: '(61) 9xxxx-xxxx', full: true }],
+    onSubmit: async v => { const d = v.telefone_dono.replace(/\D/g, ''); if (d.length < 10) throw Error('Número com DDD, por favor.'); await db.add('settings', { key: 'agente', value: { telefone_dono: d.length <= 11 ? '55' + d : d } }); await saved('Ajustes salvos.'); } }); };

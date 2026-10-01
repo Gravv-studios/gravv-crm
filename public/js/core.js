@@ -99,9 +99,10 @@ async function loadRef() {
 }
 const clientName = id => REF.clients.find(c => c.id === id)?.nome || '—';
 const catOptions = (tipo, escopo) => REF.categories.filter(c => c.ativo && (!tipo || c.tipo === tipo) && (!escopo || c.escopo === escopo)).map(c => [c.id, c.nome]);
-const acctOptions = escopo => REF.accounts.filter(a => a.ativo && (!escopo || a.escopo === escopo)).map(a => [a.id, a.nome]);
+// Conta única (GRAVV + pessoal no mesmo banco): se não houver conta ativa do escopo, mostra todas as ativas.
+const acctOptions = escopo => { const all = REF.accounts.filter(a => a.ativo); const mine = all.filter(a => !escopo || a.escopo === escopo); return (mine.length ? mine : all).map(a => [a.id, a.nome]); };
 const clientOptions = () => REF.clients.filter(c => c.status !== 'arquivado').map(c => [c.id, c.nome]);
-const defaultAccount = escopo => REF.accounts.find(a => a.ativo && a.escopo === escopo)?.id || '';
+const defaultAccount = escopo => (REF.accounts.find(a => a.ativo && a.escopo === escopo) || REF.accounts.find(a => a.ativo))?.id || '';
 
 // ---------------------------------------------------------------- componentes
 const ICONS = {
@@ -238,12 +239,12 @@ const NAV = [
   ['Comercial', [['prospeccao', 'Prospecção', 'funnel', '#/prospeccao'], ['vendas', 'Vendas', 'cart', '#/vendas'], ['follow-ups', 'Follow-ups', 'clock', '#/follow-ups'], ['leads-site', 'Leads do site', 'inbox', '#/leads-site'], ['conversas', 'Conversas', 'chat', '#/conversas'], ['avisos', 'Avisos de cobrança', 'bell', '#/avisos']]],
   ['Clientes', [['clientes', 'Clientes', 'users', '#/clientes'], ['servicos', 'Serviços', 'box', '#/servicos'], ['projetos', 'Projetos', 'folder', '#/projetos']]],
   ['Financeiro', [['financeiro', 'Visão geral', 'chart', '#/financeiro'], ['receber', 'Contas a receber', 'in', '#/financeiro/receber'], ['pagar', 'Contas a pagar', 'out', '#/financeiro/pagar'], ['fluxo', 'Fluxo de caixa', 'flow', '#/financeiro/fluxo'], ['despesas', 'Despesas', 'minus', '#/financeiro/despesas'], ['mrr', 'MRR', 'repeat', '#/mrr']]],
-  ['Pessoal', [['pessoal', 'Minhas finanças', 'wallet', '#/pessoal']]],
+  ['Pessoal', [['pessoal', 'Minhas finanças', 'wallet', '#/pessoal'], ['agente', 'Agente financeiro', 'chat', '#/agente']]],
   ['Gestão', [['relatorios', 'Relatórios', 'report', '#/relatorios']]],
 ];
 let CURRENT = { nav: '', path: '', query: new URLSearchParams() };
 const TAB_OF = { dashboard: 'inicio', prospeccao: 'funil', 'follow-ups': 'funil', vendas: 'funil', 'leads-site': 'funil',
-  financeiro: 'financeiro', receber: 'financeiro', pagar: 'financeiro', fluxo: 'financeiro', despesas: 'financeiro', mrr: 'financeiro', avisos: 'financeiro', pessoal: 'pessoal' };
+  financeiro: 'financeiro', receber: 'financeiro', pagar: 'financeiro', fluxo: 'financeiro', despesas: 'financeiro', mrr: 'financeiro', avisos: 'financeiro', pessoal: 'pessoal', agente: 'pessoal' };
 function setMenu(open) {
   $('#sidebar').classList.toggle('open', open); $('#side-backdrop').hidden = !open;
   $('#menu-toggle').setAttribute('aria-expanded', String(open)); document.body.classList.toggle('locked', open);
