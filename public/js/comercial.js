@@ -294,3 +294,50 @@ route('/conversas', 'Conversas', async q => {
 }, 'conversas');
 ACTIONS['chat-send'] = async d => { const t = $('#chat-text').value.trim(); if (!t) return; await api('/api/conversas/enviar', { method: 'POST', body: { telefone: d.tel, texto: t } }); toast('Mensagem enviada.'); await render(); };
 ACTIONS['chat-subscribe'] = async () => { const r = await api('/api/conversas/assinar', { method: 'POST' }); toast('Webhook ligado' + ((r.numeros || []).length ? ' no número ' + r.numeros.map(n => n.numero).join(', ') : '') + '.'); };
+
+// ---------------------------------------------------------------- Avisos de cobrança (WhatsApp, modelos aprovados pela Meta)
+const AV = { data: null };
+const avTone = { antes: 'mute', no_dia: 'warn', atrasado: 'bad' };
+const avWhen = a => (a.dias > 0 ? `vence em ${a.dias} dia${a.dias > 1 ? 's' : ''}` : a.dias === 0 ? 'vence hoje' : `venceu há ${-a.dias} dia${a.dias < -1 ? 's' : ''}`);
+route('/avisos', 'Avisos de cobrança', async () => {
+  let r; try { r = await api('/api/avisos'); } catch (e) { return `<div class="notice bad">${esc(e.message)}</div>`; }
+  AV.data = r; const cfg = r.config || {}; const list = r.avisos || [];
+  const missing = Object.entries(r.whatsapp || {}).filter(([, v]) => !v).map(([k]) => k);
+  const notes = [
+    missing.length ? `<div class="notice">Para enviar, falta configurar na Vercel: <b>${esc(missing.join(', '))}</b>. A lista abaixo já funciona; o botão Enviar libera quando isso estiver pronto.</div>` : '',
+    !cfg.pix ? `<div class="notice">Coloque a <b>chave Pix da GRAVV</b> em Ajustes — ela vai em todas as mensagens.</div>` : '',
+    list.some(a => !a.telefone) ? `<div class="notice">Tem cliente sem WhatsApp no cadastro. Coloque o número no cliente ou no contato principal (com DDD).</div>` : ''].join('');
+  const toolbar = `<div class="toolbar"><p class="muted grow">Avisa ${cfg.dias_antes} dia(s) antes, no dia e ${cfg.dias_depois} dia(s) depois do vencimento. Cada aviso sai uma vez só. Você confere e manda.</p>${btn('Ajustes', 'av-config')}${btn('Modelos da Meta', 'av-models')}${btn('Atualizar', 'reload', {}, 'primary')}</div>`;
+  const rows = list.map((a, i) => `<tr><td data-label="Cliente"><b>${esc(a.cliente)}</b><small>${a.telefone ? esc(fmtPhone(a.telefone)) : '<em>sem WhatsApp</em>'}</small></td>
+    <td data-label="O quê">${esc(a.descricao)}<small>${esc(avWhen(a))} · ${fdate(a.vencimento)}</small></td><td class="r" data-label="Valor">${money(a.valor)}</td>
+    <td data-label="Aviso">${badge(a.etapa_nome, avTone[a.etapa])}</td>
+    <td class="r" data-label=""><div class="actions">${btn('Ver mensagem', 'av-preview', { i })}${a.telefone ? btn('Enviar', 'av-send', { i }, 'primary small') : a.client_id ? `<a href="#/clientes/${esc(a.client_id)}">Colocar WhatsApp</a>` : ''}${btn('Ignorar', 'av-skip', { i }, 'small subtle')}</div></td></tr>`);
+  const hist = (r.historico || []).map(h => `<tr><td data-label="Quando">${fdt(h.created_at)}</td><td data-label="Cliente">${esc(clientName(h.client_id))}</td><td data-label="Aviso">${badge(ETAPA_LABEL[h.etapa] || h.etapa, avTone[h.etapa])}</td>
+    <td data-label="Status">${h.status === 'enviado' ? badge('Enviado', 'good') : badge('Ignorado', 'mute')}</td><td data-label="Mensagem"><small>${esc((h.texto || '').slice(0, 90))}</small></td></tr>`);
+  return notes + toolbar + panel(`Pra enviar agora (${list.length})`, table(['Cliente', 'O quê', ['Valor', 'r'], 'Aviso', ''], rows, 'Nenhum aviso pendente. Tudo em dia.'))
+    + panel('Últimos avisos', table(['Quando', 'Cliente', 'Aviso', 'Status', 'Mensagem'], hist, 'Nenhum aviso enviado ainda.'));
+}, 'avisos');
+const ETAPA_LABEL = { antes: 'Vai vencer', no_dia: 'Vence hoje', atrasado: 'Vencido' };
+const avItem = d => AV.data?.avisos?.[Number(d.i)];
+ACTIONS['av-preview'] = d => { const a = avItem(d); if (!a) return;
+  openSheet({ title: `Aviso para ${a.cliente}`, html: `<p class="muted">Para ${a.telefone ? esc(fmtPhone(a.telefone)) : 'sem WhatsApp'} · modelo "${esc(a.etapa_nome)}"</p><div class="bubble out" style="max-width:none;white-space:pre-wrap"><p>${esc(a.texto)}</p></div>`,
+    submit: 'Enviar no WhatsApp', onSubmit: async () => { await avSend(a); } }); };
+async function avSend(a) { await api('/api/avisos/enviar', { method: 'POST', body: { entry_id: a.entry_id, etapa: a.etapa } }); await saved(`Aviso enviado para ${a.cliente}.`); }
+ACTIONS['av-send'] = d => { const a = avItem(d); if (a) confirmSheet('Enviar aviso', `Mandar o aviso "${a.etapa_nome}" de ${money(a.valor)} para ${a.cliente} (${fmtPhone(a.telefone)})?`, async () => { await avSend(a); }, { label: 'Enviar', danger: false }); };
+ACTIONS['av-skip'] = async d => { const a = avItem(d); if (!a) return; await api('/api/avisos/ignorar', { method: 'POST', body: { entry_id: a.entry_id, etapa: a.etapa } }); await saved('Aviso ignorado.'); };
+ACTIONS['av-config'] = () => { const c = AV.data?.config || {};
+  openSheet({ title: 'Ajustes dos avisos', values: c, fields: [
+    { name: 'pix', label: 'Chave Pix da GRAVV', required: true, full: true, hint: 'Vai escrita em todas as mensagens.' },
+    { name: 'dias_antes', label: 'Avisar quantos dias antes', type: 'number', min: 0, required: true },
+    { name: 'dias_depois', label: 'Cobrar quantos dias depois de vencido', type: 'number', min: 1, required: true }],
+    onSubmit: async v => { await db.add('settings', { key: 'lembretes', value: { pix: v.pix, dias_antes: Number(v.dias_antes), dias_depois: Number(v.dias_depois) } }); await saved('Ajustes salvos.'); } }); };
+const MODEL_ST = { APPROVED: ['Aprovado', 'good'], PENDING: ['Em análise na Meta', 'warn'], REJECTED: ['Recusado', 'bad'], NAO_CRIADO: ['Ainda não criado', 'mute'], PAUSED: ['Pausado', 'warn'], DISABLED: ['Desativado', 'bad'] };
+function modelsHTML(r) {
+  return `<p class="muted">A Meta só deixa a empresa começar conversa com mensagem de modelo aprovado. A aprovação costuma sair em minutos ou poucas horas.</p>`
+    + table(['Aviso', 'Modelo', 'Status'], (r.modelos || []).map(m => { const [t, tone] = MODEL_ST[m.status] || [m.status, 'mute']; return `<tr><td>${esc(m.etapa_nome)}</td><td><small>${esc(m.nome)}</small></td><td>${badge(t, tone)}${m.motivo && m.motivo !== 'NONE' ? `<small>${esc(m.motivo)}</small>` : ''}</td></tr>`; }))
+    + ((r.erros || []).length ? `<div class="notice bad">${r.erros.map(esc).join('<br>')}</div>` : '');
+}
+ACTIONS['av-models'] = async () => { const r = await api('/api/avisos/modelos'); const falta = (r.modelos || []).some(m => m.status === 'NAO_CRIADO');
+  openSheet({ title: 'Modelos de mensagem (Meta)', html: modelsHTML(r), submit: falta ? 'Criar modelos na Meta' : 'Fechar',
+    onSubmit: async () => { if (!falta) return closeSheet(); const c = await api('/api/avisos/modelos', { method: 'POST' }); closeSheet();
+      toast(c.erros?.length ? 'A Meta recusou: ' + c.erros.join(' | ') : c.criados.length ? `${c.criados.length} modelo(s) enviados pra aprovação da Meta.` : 'Nada novo pra criar.', c.erros?.length ? 'bad' : ''); } }); };
