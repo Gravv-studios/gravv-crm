@@ -507,6 +507,198 @@ def wa_subscribe():
                                     for n in wa_numbers()]}
 
 
+# --------------------------------------------------------------------------- Avisos de vencimento
+# Mensagens que a empresa começa precisam de modelo aprovado pela Meta (categoria "utilidade").
+# Cada etapa tem um modelo; os {{n}} são preenchidos com os dados do título em aberto.
+WA_TEMPLATES = {
+    'antes': ('gravv_lembrete_vencimento', ('nome', 'descricao', 'valor', 'data', 'pix'),
+              'Olá, {{1}}! Tudo bem? Passando pra lembrar que o pagamento de {{2}}, no valor de R$ {{3}}, '
+              'vence em {{4}}.\n\nChave Pix: {{5}}\n\nSe já pagou, pode desconsiderar esta mensagem. Obrigado! Equipe GRAVV',
+              ('Carlos', 'Mensalidade Le Cabinet — 10/2026', '500,00', '07/10/2026', 'pix@gravv.com.br')),
+    'no_dia': ('gravv_vence_hoje', ('nome', 'descricao', 'valor', 'pix'),
+               'Olá, {{1}}! Tudo bem? Hoje vence o pagamento de {{2}}, no valor de R$ {{3}}.\n\nChave Pix: {{4}}\n\n'
+               'Se já pagou, pode desconsiderar esta mensagem. Obrigado! Equipe GRAVV',
+               ('Carlos', 'Mensalidade Le Cabinet — 10/2026', '500,00', 'pix@gravv.com.br')),
+    'atrasado': ('gravv_pagamento_em_aberto', ('nome', 'descricao', 'valor', 'data', 'pix'),
+                 'Olá, {{1}}! Tudo bem? Ainda não identificamos o pagamento de {{2}}, no valor de R$ {{3}}, '
+                 'que venceu em {{4}}.\n\nChave Pix: {{5}}\n\nSe já pagou, é só responder com o comprovante. Obrigado! Equipe GRAVV',
+                 ('Carlos', 'Mensalidade Le Cabinet — 10/2026', '500,00', '07/10/2026', 'pix@gravv.com.br')),
+}
+ETAPA_NOME = {'antes': 'Vai vencer', 'no_dia': 'Vence hoje', 'atrasado': 'Vencido'}
+
+
+def rem_config():
+    status, rows = supabase('GET', '/rest/v1/settings?key=eq.lembretes&select=value')
+    value = (rows[0].get('value') if status == 200 and rows else None) or {}
+    def days(name, default):
+        try:
+            return max(0, min(30, int(value.get(name, default))))
+        except (TypeError, ValueError):
+            return default
+    return {'pix': str(value.get('pix') or '').strip(), 'dias_antes': days('dias_antes', 3), 'dias_depois': days('dias_depois', 2)}
+
+
+def br_phone(raw):
+    digits = re.sub(r'\D', '', str(raw or ''))
+    if len(digits) in (10, 11):
+        digits = '55' + digits
+    return digits if 12 <= len(digits) <= 15 else ''
+
+
+def br_money(value):
+    text = f'{float(value or 0):,.2f}'
+    return text.replace(',', 'X').replace('.', ',').replace('X', '.')
+
+
+def br_date(iso):
+    y, m, d = str(iso)[:10].split('-')
+    return f'{d}/{m}/{y}'
+
+
+def rem_text(etapa, values):
+    _, _, body, _ = WA_TEMPLATES[etapa]
+    for i, value in enumerate(values, 1):
+        body = body.replace('{{%d}}' % i, value)
+    return body
+
+
+def rem_queue():
+    """Títulos a receber da GRAVV que pedem aviso hoje, já sem os avisados/ignorados."""
+    cfg = rem_config()
+    hoje = datetime.now(BRASILIA).date()
+    limite = (hoje + timedelta(days=cfg['dias_antes'])).isoformat()
+    entries = db_read('v_entries', 'select=id,descricao,client_id,client_nome,open_amount,due_date,status'
+                                   f'&escopo=eq.empresa&tipo=eq.income&status=in.(pending,partial)&due_date=lte.{limite}&order=due_date.asc')
+    entries = [e for e in entries if float(e.get('open_amount') or 0) > 0]
+    if not entries:
+        return cfg, []
+    ids = ','.join(e['id'] for e in entries)
+    status, done = supabase('GET', f'/rest/v1/wa_lembretes?select=entry_id,etapa&entry_id=in.({ids})')
+    if status != 200:
+        raise RequestError('Falta rodar o SQL dos avisos (05-lembretes-whatsapp.sql) no Supabase.', 503)
+    feitos = {(d['entry_id'], d['etapa']) for d in done or []}
+    client_ids = sorted({e['client_id'] for e in entries if e.get('client_id')})
+    clients, contacts = {}, {}
+    if client_ids:
+        lista = ','.join(client_ids)
+        clients = {c['id']: c for c in db_read('clients', f'select=id,nome,telefone&id=in.({lista})')}
+        for k in db_read('client_contacts', f'select=client_id,nome,telefone,principal&client_id=in.({lista})&order=principal.desc'):
+            if k['client_id'] not in contacts or (not br_phone(contacts[k['client_id']].get('telefone')) and br_phone(k.get('telefone'))):
+                contacts[k['client_id']] = k
+    fila = []
+    for e in entries:
+        vence = datetime.strptime(e['due_date'][:10], '%Y-%m-%d').date()
+        atraso = (hoje - vence).days
+        if atraso >= max(1, cfg['dias_depois']):
+            etapa = 'atrasado'
+        elif atraso == 0:
+            etapa = 'no_dia'
+        elif atraso < 0:
+            etapa = 'antes'
+        else:
+            continue  # vencido há pouco: espera o prazo de tolerância
+        if (e['id'], etapa) in feitos:
+            continue
+        cliente = clients.get(e.get('client_id')) or {}
+        contato = contacts.get(e.get('client_id')) or {}
+        telefone = br_phone(contato.get('telefone')) or br_phone(cliente.get('telefone'))
+        nome = (contato.get('nome') or cliente.get('nome') or e.get('client_nome') or 'tudo bem').split(' ')[0]
+        dados = {'nome': nome, 'descricao': e['descricao'], 'valor': br_money(e['open_amount']),
+                 'data': br_date(e['due_date']), 'pix': cfg['pix'] or '(sem chave Pix)'}
+        valores = [dados[c] for c in WA_TEMPLATES[etapa][1]]
+        fila.append({'entry_id': e['id'], 'etapa': etapa, 'etapa_nome': ETAPA_NOME[etapa], 'client_id': e.get('client_id'),
+                     'cliente': e.get('client_nome') or '—', 'descricao': e['descricao'], 'valor': float(e['open_amount']),
+                     'vencimento': e['due_date'][:10], 'dias': -atraso, 'telefone': telefone, 'contato': nome,
+                     'texto': rem_text(etapa, valores), '_valores': valores})
+    return cfg, fila
+
+
+def rem_list():
+    cfg, fila = rem_queue()
+    for item in fila:
+        item.pop('_valores', None)
+    status, hist = supabase('GET', '/rest/v1/wa_lembretes?select=entry_id,client_id,etapa,status,telefone,texto,created_at'
+                                   '&order=created_at.desc&limit=30')
+    return {'config': cfg, 'avisos': fila, 'whatsapp': wa_configured(), 'historico': hist if status == 200 else []}
+
+
+def rem_pick(data):
+    if not isinstance(data, dict) or not UUID.fullmatch(str(data.get('entry_id', ''))) or data.get('etapa') not in WA_TEMPLATES:
+        raise RequestError('Aviso inválido.')
+    _, fila = rem_queue()  # recalcula no servidor: não confia no que veio da tela
+    for item in fila:
+        if item['entry_id'] == data['entry_id'] and item['etapa'] == data['etapa']:
+            return item
+    raise RequestError('Esse aviso já foi enviado, ignorado ou o título já foi pago.', 409)
+
+
+def rem_log(item, status, message_id=''):
+    row = {'entry_id': item['entry_id'], 'client_id': item.get('client_id'), 'etapa': item['etapa'], 'telefone': item.get('telefone') or None,
+           'status': status, 'wa_message_id': message_id or None, 'texto': item['texto'] if status == 'enviado' else None}
+    code, result = supabase('POST', '/rest/v1/wa_lembretes', [row], headers={'Prefer': 'return=minimal'})
+    if code not in (200, 201):
+        raise db_error(code, result, 'Não foi possível registrar o aviso.')
+
+
+def rem_send(data):
+    item = rem_pick(data)
+    if not item['telefone']:
+        raise RequestError(f'{item["cliente"]} está sem WhatsApp no cadastro. Coloque o número no cliente ou no contato principal.')
+    cfg = rem_config()
+    if not cfg['pix']:
+        raise RequestError('Coloque a chave Pix da GRAVV nos ajustes dos avisos antes de enviar.')
+    name = WA_TEMPLATES[item['etapa']][0]
+    body = {'messaging_product': 'whatsapp', 'to': item['telefone'], 'type': 'template',
+            'template': {'name': name, 'language': {'code': 'pt_BR'},
+                         'components': [{'type': 'body', 'parameters': [{'type': 'text', 'text': v} for v in item['_valores']]}]}}
+    status, result = graph('POST', f'/{wa_phone_id()}/messages', body)
+    if status != 200:
+        err = (result or {}).get('error') or {}
+        detail = err.get('message', '') or 'erro desconhecido'
+        if err.get('code') in (132001, 132000) or 'template' in detail.lower():
+            raise RequestError('O modelo de mensagem ainda não foi aprovado pela Meta. Veja o status em Avisos › Modelos.', 409)
+        raise RequestError('A Meta recusou o envio: ' + detail + '.', 502)
+    message_id = ((result.get('messages') or [{}])[0]).get('id', '')
+    rem_log(item, 'enviado', message_id)
+    wa_store([{'id': message_id, 'telefone': item['telefone'], 'nome': item['contato'], 'direcao': 'saida', 'tipo': 'template',
+               'texto': item['texto'], 'enviado_em': datetime.now(timezone.utc).isoformat(), 'origem': 'crm', 'status': 'sent'}], [])
+    return {'ok': True, 'id': message_id}
+
+
+def rem_skip(data):
+    rem_log(rem_pick(data), 'ignorado')
+    return {'ok': True}
+
+
+def rem_templates():
+    names = {t[0]: etapa for etapa, t in WA_TEMPLATES.items()}
+    status, result = graph('GET', f'/{wa_waba()}/message_templates?fields=name,status,language,rejected_reason&limit=200')
+    if status != 200:
+        detail = ((result or {}).get('error') or {}).get('message', 'erro desconhecido')
+        raise RequestError('A Meta não mostrou os modelos: ' + detail, 502)
+    found = {t['name']: t for t in result.get('data') or [] if t.get('name') in names and t.get('language') == 'pt_BR'}
+    return {'modelos': [{'etapa': etapa, 'etapa_nome': ETAPA_NOME[etapa], 'nome': t[0],
+                         'status': (found.get(t[0]) or {}).get('status', 'NAO_CRIADO'),
+                         'motivo': (found.get(t[0]) or {}).get('rejected_reason', '')} for etapa, t in WA_TEMPLATES.items()]}
+
+
+def rem_create_templates():
+    atuais = {m['nome']: m['status'] for m in rem_templates()['modelos']}
+    criados, erros = [], []
+    for etapa, (name, _, body, example) in WA_TEMPLATES.items():
+        if atuais.get(name) != 'NAO_CRIADO':
+            continue
+        status, result = graph('POST', f'/{wa_waba()}/message_templates', {
+            'name': name, 'language': 'pt_BR', 'category': 'UTILITY',
+            'components': [{'type': 'BODY', 'text': body, 'example': {'body_text': [list(example)]}}]})
+        if status == 200:
+            criados.append(name)
+        else:
+            erros.append(name + ': ' + (((result or {}).get('error') or {}).get('error_user_msg')
+                                        or ((result or {}).get('error') or {}).get('message', 'erro desconhecido')))
+    return {'criados': criados, 'erros': erros, **rem_templates()}
+
+
 # --------------------------------------------------------------------------- Auth
 def auth_token(grant, payload):
     status, data = supabase('POST', f'/auth/v1/token?grant_type={grant}', payload)
@@ -821,6 +1013,12 @@ class handler(BaseHTTPRequestHandler):  # nome exigido pelo runtime Python da Ve
                 self._reply(200, wa_send(self._json()))
             elif path == '/api/conversas/assinar':
                 self._reply(200, wa_subscribe())
+            elif path == '/api/avisos/enviar':
+                self._reply(200, rem_send(self._json()))
+            elif path == '/api/avisos/ignorar':
+                self._reply(200, rem_skip(self._json()))
+            elif path == '/api/avisos/modelos':
+                self._reply(200, rem_create_templates())
             else:
                 raise RequestError('Ação não encontrada.', 404)
             return
@@ -843,6 +1041,10 @@ class handler(BaseHTTPRequestHandler):  # nome exigido pelo runtime Python da Ve
                         {'Content-Disposition': f'attachment; filename="gravv-crm-backup-{today()}.json"'})
         elif path == '/api/conversas':
             self._reply(200, {'mensagens': wa_list(), 'configuracao': wa_configured()})
+        elif path == '/api/avisos':
+            self._reply(200, rem_list())
+        elif path == '/api/avisos/modelos':
+            self._reply(200, rem_templates())
         else:
             raise RequestError('Página não encontrada.', 404)
 
