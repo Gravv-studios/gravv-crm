@@ -699,6 +699,392 @@ def rem_create_templates():
     return {'criados': criados, 'erros': erros, **rem_templates()}
 
 
+# --------------------------------------------------------------------------- Agente financeiro (Claude)
+# Conversa com o Marcos pelo CRM e pelo WhatsApp: lança gastos/entradas, dá baixa e diz quanto pode gastar.
+#   ANTHROPIC_API_KEY  chave da API da Anthropic (console.anthropic.com) — cobrada por uso
+#   ANTHROPIC_MODEL    (opcional) modelo; padrão claude-haiku-4-5-20251001 (mais barato)
+AG_DEFAULT_MODEL = 'claude-haiku-4-5-20251001'
+AG_NOTA = 'via agente'
+
+
+def ag_settings():
+    status, rows = supabase('GET', '/rest/v1/settings?key=eq.agente&select=value')
+    value = (rows[0].get('value') if status == 200 and rows else None) or {}
+    return {'telefone_dono': re.sub(r'\D', '', str(value.get('telefone_dono') or ''))}
+
+
+def ag_account():
+    accounts = db_read('financial_accounts', 'select=id,nome,ativo,created_at&ativo=is.true&order=created_at.asc')
+    if not accounts:
+        raise RequestError('Nenhuma conta ativa no CRM.')
+    return accounts[0]['id']
+
+
+def ag_categories():
+    return db_read('financial_categories', 'select=id,nome,tipo,escopo&ativo=is.true&order=nome.asc')
+
+
+def ag_month_bounds(d):
+    first = d.replace(day=1)
+    nxt = (first + timedelta(days=32)).replace(day=1)
+    return first, nxt - timedelta(days=1)
+
+
+def fin_summary():
+    """Fotografia do dinheiro: saldo, compromissos, quanto dá pra gastar até o fim do período e gastos do mês."""
+    hoje = datetime.now(BRASILIA).date()
+    ini_mes, fim_mes = ag_month_bounds(hoje)
+    # horizonte: fim do mês; se faltar pouco (<10 dias), vai até o fim do mês seguinte
+    fim = fim_mes if (fim_mes - hoje).days >= 10 else ag_month_bounds(fim_mes + timedelta(days=1))[1]
+    prox_ini, prox_fim = ag_month_bounds(fim + timedelta(days=1))
+    contas = db_read('v_account_balances', 'select=nome,saldo,ativo')
+    saldo = round(sum(float(c['saldo'] or 0) for c in contas if c.get('ativo')), 2)
+    abertos = db_read('v_entries', 'select=id,tipo,escopo,descricao,open_amount,due_date,client_nome,category_nome'
+                                   f'&status=in.(pending,partial)&due_date=lte.{prox_fim.isoformat()}&order=due_date.asc')
+    compromissos, eventos, eventos_conservador = [], {}, {}
+    prox_in = prox_out = 0.0
+    prox_desc = []
+    for e in abertos:
+        valor = float(e['open_amount'] or 0)
+        if valor <= 0:
+            continue
+        vence = datetime.strptime(e['due_date'][:10], '%Y-%m-%d').date()
+        if vence > fim:
+            if prox_ini <= vence <= prox_fim:
+                prox_desc.append(e['descricao'])
+                if e['tipo'] == 'income':
+                    prox_in += valor
+                else:
+                    prox_out += valor
+            continue
+        quando = max(vence, hoje)
+        sinal = valor if e['tipo'] == 'income' else -valor
+        eventos[quando] = eventos.get(quando, 0) + sinal
+        if sinal < 0:
+            eventos_conservador[quando] = eventos_conservador.get(quando, 0) + sinal
+        compromissos.append({'id': e['id'], 'tipo': 'receber' if e['tipo'] == 'income' else 'pagar', 'escopo': e['escopo'],
+                             'descricao': e['descricao'], 'cliente': e.get('client_nome'), 'valor': valor,
+                             'vence': e['due_date'][:10], 'atrasado': vence < hoje})
+
+    def folga(ev):
+        corrente, minimo, dia = saldo, saldo, hoje
+        for quando in sorted(ev):
+            corrente += ev[quando]
+            if corrente < minimo:
+                minimo, dia = corrente, quando
+        return round(minimo, 2), dia
+
+    livre, dia_critico = folga(eventos)
+    livre_cons, _ = folga(eventos_conservador)
+    dias = max(1, (fim - hoje).days + 1)
+    # mensais sem cobrança gerada (ex.: contrato com dia ainda não definido) entram como previsão do mês seguinte
+    for s in db_read('v_client_services', 'select=valor,periodicidade,status,next_billing_date,descricao&status=eq.active&periodicidade=eq.monthly'):
+        nb = s.get('next_billing_date')
+        if not nb or prox_ini.isoformat() <= nb[:10] <= prox_fim.isoformat():
+            ja = any(d.startswith(s['descricao']) for d in prox_desc)
+            if not ja:
+                prox_in += float(s['valor'] or 0)
+    pags = db_read('v_payments', f'select=amount,tipo,escopo,category_nome,descricao,paid_at&reversed=is.false&paid_at=gte.{ini_mes.isoformat()}')
+    gastos, entradas = {}, 0.0
+    for p in pags:
+        if p['tipo'] == 'expense':
+            cat = p.get('category_nome') or 'Sem categoria'
+            gastos[cat] = round(gastos.get(cat, 0) + float(p['amount']), 2)
+        else:
+            entradas += float(p['amount'])
+    return {
+        'hoje': hoje.isoformat(), 'saldo_no_banco': saldo,
+        'livre_para_gastar': livre, 'dia_mais_apertado': dia_critico.isoformat(),
+        'livre_por_dia': round(livre / dias, 2), 'ate': fim.isoformat(), 'dias_no_periodo': dias,
+        'livre_se_nada_entrar': livre_cons,
+        'compromissos': compromissos,
+        'gastos_do_mes_por_categoria': dict(sorted(gastos.items(), key=lambda kv: -kv[1])),
+        'total_gasto_no_mes': round(sum(gastos.values()), 2), 'total_recebido_no_mes': round(entradas, 2),
+        'proximo_mes': {'mes': prox_ini.strftime('%m/%Y'), 'entradas_previstas': round(prox_in, 2),
+                        'saidas_previstas': round(prox_out, 2), 'resultado': round(prox_in - prox_out, 2)},
+    }
+
+
+AG_TOOLS = [
+    {'name': 'registrar_gasto', 'description': 'Lança um gasto JÁ PAGO (sai do saldo agora). Use para tudo que o Marcos disser que gastou/pagou e que não seja um compromisso já listado (para esses use dar_baixa).',
+     'input_schema': {'type': 'object', 'properties': {
+         'valor': {'type': 'number', 'description': 'Valor em reais, positivo.'},
+         'descricao': {'type': 'string', 'description': 'Curta, ex.: "Almoço", "Gasolina", "iFood".'},
+         'categoria': {'type': 'string', 'description': 'Nome exato de uma categoria de saída da lista do sistema.'},
+         'escopo': {'type': 'string', 'enum': ['pessoal', 'empresa'], 'description': 'pessoal (padrão) ou empresa (gasto da GRAVV).'},
+         'data': {'type': 'string', 'description': 'AAAA-MM-DD. Omitir = hoje.'},
+         'forma': {'type': 'string', 'description': 'Pix, cartão de débito, cartão de crédito, dinheiro…'}},
+         'required': ['valor', 'descricao', 'categoria']}},
+    {'name': 'registrar_entrada', 'description': 'Lança dinheiro que JÁ ENTROU e que não está na lista de compromissos a receber (para esses use dar_baixa).',
+     'input_schema': {'type': 'object', 'properties': {
+         'valor': {'type': 'number'}, 'descricao': {'type': 'string'},
+         'categoria': {'type': 'string', 'description': 'Nome exato de uma categoria de entrada.'},
+         'escopo': {'type': 'string', 'enum': ['pessoal', 'empresa']}, 'data': {'type': 'string'}},
+         'required': ['valor', 'descricao', 'categoria']}},
+    {'name': 'dar_baixa', 'description': 'Marca como pago/recebido um compromisso da lista (parcela do carro, faculdade, cliente que pagou…). Pode ser parcial.',
+     'input_schema': {'type': 'object', 'properties': {
+         'compromisso_id': {'type': 'string', 'description': 'id do compromisso (vem do resumo).'},
+         'valor': {'type': 'number', 'description': 'Omitir = valor em aberto inteiro.'}, 'data': {'type': 'string'}},
+         'required': ['compromisso_id']}},
+    {'name': 'resumo_financeiro', 'description': 'Saldo, quanto ainda dá pra gastar, compromissos e gastos do mês. Chame depois de lançar algo para responder com números atualizados.',
+     'input_schema': {'type': 'object', 'properties': {}}},
+    {'name': 'listar_lancamentos', 'description': 'Últimos lançamentos pagos/recebidos, com id do pagamento (para desfazer).',
+     'input_schema': {'type': 'object', 'properties': {'dias': {'type': 'integer', 'description': 'Quantos dias para trás (padrão 7).'}}}},
+    {'name': 'desfazer_lancamento', 'description': 'Desfaz um pagamento lançado por engano (estorna). Use o pagamento_id de listar_lancamentos.',
+     'input_schema': {'type': 'object', 'properties': {'pagamento_id': {'type': 'string'}, 'motivo': {'type': 'string'}},
+                      'required': ['pagamento_id']}},
+]
+
+
+def ag_date(value):
+    if value and re.fullmatch(r'\d{4}-\d{2}-\d{2}', str(value)):
+        return str(value)
+    return today()
+
+
+def ag_category_id(nome, tipo, escopo):
+    cats = ag_categories()
+    alvo = str(nome or '').strip().lower()
+    for c in cats:
+        if c['tipo'] == tipo and c['escopo'] == escopo and c['nome'].lower() == alvo:
+            return c['id']
+    for c in cats:
+        if c['tipo'] == tipo and c['escopo'] == escopo and c['nome'].lower().startswith('outra'):
+            return c['id']
+    return None
+
+
+def ag_money(value):
+    try:
+        v = round(float(value), 2)
+    except (TypeError, ValueError):
+        raise RequestError('Valor inválido.')
+    if not 0 < v < 1_000_000:
+        raise RequestError('Valor inválido.')
+    return v
+
+
+def ag_run_tool(name, args):
+    args = args if isinstance(args, dict) else {}
+    if name == 'resumo_financeiro':
+        return fin_summary()
+    if name in ('registrar_gasto', 'registrar_entrada'):
+        tipo = 'expense' if name == 'registrar_gasto' else 'income'
+        escopo = 'empresa' if args.get('escopo') == 'empresa' else 'pessoal'
+        valor = ag_money(args.get('valor'))
+        descricao = clean(str(args.get('descricao') or ''), 'descrição', 120, True)
+        r = db_rpc('quick_entry', {'p': {'tipo': tipo, 'escopo': escopo, 'descricao': descricao, 'amount': valor,
+                                         'category_id': ag_category_id(args.get('categoria'), tipo, escopo) or '',
+                                         'account_id': ag_account(), 'paid_at': ag_date(args.get('data')),
+                                         'payment_method': str(args.get('forma') or '')[:40], 'notas': AG_NOTA}})
+        return {'ok': True, 'lancamento_id': (r or {}).get('entry_id'), 'valor': valor, 'descricao': descricao}
+    if name == 'dar_baixa':
+        eid = str(args.get('compromisso_id') or '')
+        if not UUID.fullmatch(eid):
+            return {'erro': 'compromisso_id inválido'}
+        e = db_read('v_entries', f'select=id,descricao,open_amount,status&id=eq.{eid}')
+        if not e or e[0]['status'] not in ('pending', 'partial'):
+            return {'erro': 'Compromisso não encontrado ou já quitado.'}
+        valor = ag_money(args.get('valor')) if args.get('valor') else float(e[0]['open_amount'])
+        db_rpc('settle_entry', {'p': {'entry_id': eid, 'amount': valor, 'paid_at': ag_date(args.get('data')),
+                                      'account_id': ag_account(), 'notes': AG_NOTA}})
+        return {'ok': True, 'descricao': e[0]['descricao'], 'valor': valor}
+    if name == 'listar_lancamentos':
+        dias = max(1, min(60, int(args.get('dias') or 7)))
+        desde = (datetime.now(BRASILIA).date() - timedelta(days=dias)).isoformat()
+        pays = db_read('v_payments', 'select=id,amount,tipo,escopo,descricao,category_nome,paid_at,notes,reversed'
+                                     f'&paid_at=gte.{desde}&reversed=is.false&order=paid_at.desc,created_at.desc&limit=40')
+        return [{'pagamento_id': p['id'], 'data': p['paid_at'], 'tipo': 'saída' if p['tipo'] == 'expense' else 'entrada',
+                 'escopo': p['escopo'], 'descricao': p['descricao'], 'categoria': p.get('category_nome'), 'valor': float(p['amount'])}
+                for p in pays]
+    if name == 'desfazer_lancamento':
+        pid = str(args.get('pagamento_id') or '')
+        if not UUID.fullmatch(pid):
+            return {'erro': 'pagamento_id inválido'}
+        db_rpc('reverse_payment', {'p_payment': pid, 'p_reason': (str(args.get('motivo') or '') or 'Desfeito pelo agente')[:200]})
+        pay = db_read('financial_payments', f'select=entry_id&id=eq.{pid}')
+        if pay:
+            ent = db_read('financial_entries', f"select=id,notas,paid_amount&id=eq.{pay[0]['entry_id']}")
+            if ent and (ent[0].get('notas') or '') == AG_NOTA and float(ent[0]['paid_amount'] or 0) == 0:
+                supabase('PATCH', f"/rest/v1/financial_entries?id=eq.{ent[0]['id']}", {'status': 'cancelled'})
+        return {'ok': True}
+    return {'erro': 'ferramenta desconhecida'}
+
+
+def ag_system(resumo):
+    cats = ag_categories()
+    saida = ', '.join(sorted({c['nome'] for c in cats if c['tipo'] == 'expense' and c['escopo'] == 'pessoal'}))
+    saida_emp = ', '.join(sorted({c['nome'] for c in cats if c['tipo'] == 'expense' and c['escopo'] == 'empresa'}))
+    entrada = ', '.join(sorted({f"{c['nome']} ({c['escopo']})" for c in cats if c['tipo'] == 'income'}))
+    fixo = f"""Você é o agente financeiro do Marcos (dono da agência GRAVV, estudante de ADS no CEUB, Brasília).
+Fala em português do Brasil, informal e curto, como no WhatsApp: no máximo uns 6 linhas, sem markdown pesado (use *negrito* só para o número principal).
+O dinheiro dele está numa conta só (GRAVV + pessoal juntos). Prioridades, nessa ordem: parcela do carro (dia 20, R$ 2.000, pro sogro Marcelo),
+faculdade CEUB (dia 3; até o dia 3 sai com desconto), IPVA + licenciamento até o fim do ano, e comer bem. Depois disso, o resto é lazer.
+Regras:
+- Nunca invente números: use o resumo abaixo ou as ferramentas.
+- Quando ele contar um gasto ("gastei 32 no almoço", "abasteci 100"), lance com registrar_gasto e responda com o que sobrou livre até o dia mais apertado e quanto dá por dia.
+- Se o gasto for um compromisso da lista (ex.: "paguei a faculdade", "mandei a parcela do carro"), use dar_baixa com o id certo.
+- Se ele disser que um cliente pagou, procure o compromisso a receber e use dar_baixa; se não houver, registrar_entrada.
+- Se faltar o valor, pergunte antes de lançar. Se a mensagem tiver vários gastos, lance cada um.
+- Se ele mandar foto de comprovante, leia valor, data e para quem, e lance (ou dê baixa).
+- Errou? Use listar_lancamentos e desfazer_lancamento.
+- Dê conselho direto quando o livre por dia ficar baixo ou negativo: diga o que cortar e o que está em risco (ex.: a parcela do carro).
+- Não dê conselho de investimento.
+Categorias de saída pessoais: {saida}.
+Categorias de saída da empresa: {saida_emp}.
+Categorias de entrada: {entrada}.
+Mapeamento comum: almoço/janta/mercado/ifood/lanche → Alimentação; gasolina/uber/estacionamento → Transporte; netflix/spotify/apps → Assinaturas;
+role/bar/cinema → Lazer; aluguel/luz/internet de casa → Moradia; ferramentas/hospedagem da GRAVV → Ferramentas e software (empresa)."""
+    dados = 'Resumo atual (JSON, valores em R$):\n' + json.dumps(resumo, ensure_ascii=False)
+    return [{'type': 'text', 'text': fixo, 'cache_control': {'type': 'ephemeral'}}, {'type': 'text', 'text': dados}]
+
+
+def anthropic_call(body):
+    key = env('ANTHROPIC_API_KEY')
+    if not key:
+        raise RequestError('Agente ainda não configurado: falta ANTHROPIC_API_KEY na Vercel.', 503)
+    request = Request('https://api.anthropic.com/v1/messages', data=json.dumps(body).encode(), method='POST',
+                      headers={'x-api-key': key, 'anthropic-version': '2023-06-01', 'content-type': 'application/json'})
+    try:
+        with urlopen(request, timeout=40) as response:
+            return json.loads(response.read())
+    except HTTPError as exc:
+        try:
+            detail = (json.loads(exc.read() or b'{}').get('error') or {}).get('message', '')
+        except ValueError:
+            detail = ''
+        raise RequestError('A IA recusou o pedido: ' + (detail or f'erro {exc.code}'), 502)
+    except (URLError, TimeoutError, OSError):
+        raise RequestError('A IA não respondeu agora. Tente de novo.', 503)
+
+
+def ag_history(canal, limit=12):
+    status, rows = supabase('GET', f'/rest/v1/agente_mensagens?select=papel,texto&canal=eq.{quote(canal)}&order=created_at.desc&limit={limit}')
+    msgs = []
+    for r in reversed(rows if status == 200 and isinstance(rows, list) else []):
+        role = 'assistant' if r['papel'] == 'agente' else 'user'
+        if msgs and msgs[-1]['role'] == role:
+            msgs[-1]['content'] += '\n' + r['texto']
+        else:
+            msgs.append({'role': role, 'content': r['texto']})
+    while msgs and msgs[0]['role'] != 'user':
+        msgs.pop(0)
+    return msgs
+
+
+def ag_save(canal, papel, texto):
+    supabase('POST', '/rest/v1/agente_mensagens', [{'canal': canal, 'papel': papel, 'texto': str(texto)[:4000]}],
+             headers={'Prefer': 'return=minimal'})
+
+
+def ag_chat(canal, texto, imagem=None):
+    """Uma rodada de conversa com o agente. imagem = (mime, base64) opcional."""
+    texto = (texto or '').strip()[:2000]
+    if not texto and not imagem:
+        raise RequestError('Mensagem vazia.')
+    history = ag_history(canal)
+    content = []
+    if imagem:
+        content.append({'type': 'image', 'source': {'type': 'base64', 'media_type': imagem[0], 'data': imagem[1]}})
+    content.append({'type': 'text', 'text': texto or '(foto enviada, provavelmente um comprovante)'})
+    if history and history[-1]['role'] == 'user':
+        history[-1] = {'role': 'user', 'content': [{'type': 'text', 'text': history[-1]['content']}] + content}
+    else:
+        history.append({'role': 'user', 'content': content})
+    ag_save(canal, 'dono', texto or '[foto]')
+    system = ag_system(fin_summary())
+    model = env('ANTHROPIC_MODEL') or AG_DEFAULT_MODEL
+    acoes, resposta = [], ''
+    for _ in range(6):
+        out = anthropic_call({'model': model, 'max_tokens': 900, 'system': system, 'tools': AG_TOOLS, 'messages': history})
+        blocks = out.get('content') or []
+        history.append({'role': 'assistant', 'content': blocks})
+        uses = [b for b in blocks if b.get('type') == 'tool_use']
+        resposta = '\n'.join(b.get('text', '') for b in blocks if b.get('type') == 'text').strip()
+        if not uses:
+            break
+        results = []
+        for u in uses:
+            try:
+                result = ag_run_tool(u.get('name'), u.get('input'))
+                if u.get('name') not in ('resumo_financeiro', 'listar_lancamentos'):
+                    acoes.append({'acao': u.get('name'), 'dados': u.get('input'), 'ok': True})
+            except RequestError as exc:
+                result = {'erro': str(exc)}
+            results.append({'type': 'tool_result', 'tool_use_id': u.get('id'),
+                            'content': json.dumps(result, ensure_ascii=False, default=str)[:12000]})
+        history.append({'role': 'user', 'content': results})
+    resposta = resposta or 'Feito.'
+    ag_save(canal, 'agente', resposta)
+    return {'resposta': resposta, 'acoes': acoes}
+
+
+def ag_overview():
+    status, rows = supabase('GET', "/rest/v1/agente_mensagens?select=papel,texto,created_at,canal&order=created_at.desc&limit=40")
+    return {'resumo': fin_summary(), 'mensagens': list(reversed(rows)) if status == 200 and isinstance(rows, list) else [],
+            'config': {**ag_settings(), 'ia': bool(env('ANTHROPIC_API_KEY')), 'modelo': env('ANTHROPIC_MODEL') or AG_DEFAULT_MODEL,
+                       'whatsapp': bool(env('WHATSAPP_TOKEN'))}}
+
+
+def wa_reply_text(phone, text):
+    status, result = graph('POST', f'/{wa_phone_id()}/messages', {'messaging_product': 'whatsapp', 'to': phone,
+                                                                 'type': 'text', 'text': {'body': text[:4000]}})
+    if status == 200:
+        mid = ((result.get('messages') or [{}])[0]).get('id', '')
+        wa_store([{'id': mid, 'telefone': phone, 'nome': '', 'direcao': 'saida', 'tipo': 'text', 'texto': text[:4000],
+                   'enviado_em': datetime.now(timezone.utc).isoformat(), 'origem': 'agente', 'status': 'sent'}], [])
+
+
+def wa_media(media_id):
+    status, info = graph('GET', f'/{media_id}')
+    url, mime = (info or {}).get('url'), (info or {}).get('mime_type', '')
+    if status != 200 or not url or mime not in ('image/jpeg', 'image/png', 'image/webp'):
+        return None
+    request = Request(url, headers={'Authorization': 'Bearer ' + env('WHATSAPP_TOKEN')})
+    with urlopen(request, timeout=12) as response:
+        data = response.read(5 * 1024 * 1024 + 1)
+    if len(data) > 5 * 1024 * 1024:
+        return None
+    import base64
+    return mime, base64.b64encode(data).decode()
+
+
+def ag_from_webhook(payload):
+    """Mensagens do próprio Marcos para o número da GRAVV viram conversa com o agente."""
+    if not env('ANTHROPIC_API_KEY') or not env('WHATSAPP_TOKEN'):
+        return
+    dono = ag_settings()['telefone_dono']
+    if len(dono) < 10:
+        return
+    for entry in payload.get('entry') or []:
+        for change in entry.get('changes') or []:
+            if change.get('field') != 'messages':
+                continue
+            for message in (change.get('value') or {}).get('messages') or []:
+                phone = re.sub(r'\D', '', str(message.get('from') or ''))
+                if not phone or phone[-8:] != dono[-8:]:
+                    continue
+                code, novo = supabase('POST', '/rest/v1/agente_turnos?on_conflict=message_id', [{'message_id': str(message.get('id'))[:200]}],
+                                      headers={'Prefer': 'resolution=ignore-duplicates,return=representation'})
+                if code not in (200, 201) or not novo:
+                    continue  # a Meta reenviou a mesma mensagem
+                kind = message.get('type')
+                try:
+                    if kind == 'text':
+                        out = ag_chat('whatsapp', (message.get('text') or {}).get('body', ''))
+                    elif kind == 'image':
+                        img = wa_media((message.get('image') or {}).get('id', ''))
+                        out = ag_chat('whatsapp', (message.get('image') or {}).get('caption', ''), img) if img else \
+                            {'resposta': 'Não consegui abrir essa imagem. Manda de novo ou escreve o valor.'}
+                    elif kind == 'audio':
+                        out = {'resposta': 'Ainda não escuto áudio 😅 Manda em texto, tipo: "gastei 32 no almoço".'}
+                    else:
+                        continue
+                except RequestError as exc:
+                    out = {'resposta': 'Deu um problema aqui: ' + str(exc)}
+                wa_reply_text(phone, out['resposta'])
+
+
 # --------------------------------------------------------------------------- Auth
 def auth_token(grant, payload):
     status, data = supabase('POST', f'/auth/v1/token?grant_type={grant}', payload)
@@ -950,6 +1336,10 @@ class handler(BaseHTTPRequestHandler):  # nome exigido pelo runtime Python da Ve
             except (ValueError, UnicodeError):
                 raise RequestError('Envio inválido.')
             wa_store(*wa_extract(payload if isinstance(payload, dict) else {}))
+            try:
+                ag_from_webhook(payload if isinstance(payload, dict) else {})
+            except Exception:
+                traceback.print_exc(file=sys.stderr)  # o agente nunca derruba o webhook
             self._reply(200, {'ok': True})
             return
         if method == 'OPTIONS':
@@ -1019,6 +1409,11 @@ class handler(BaseHTTPRequestHandler):  # nome exigido pelo runtime Python da Ve
                 self._reply(200, rem_skip(self._json()))
             elif path == '/api/avisos/modelos':
                 self._reply(200, rem_create_templates())
+            elif path == '/api/agente/chat':
+                data = self._json()
+                if not isinstance(data, dict):
+                    raise RequestError('Envio inválido.')
+                self._reply(200, ag_chat('crm', str(data.get('texto') or '')))
             else:
                 raise RequestError('Ação não encontrada.', 404)
             return
@@ -1045,6 +1440,8 @@ class handler(BaseHTTPRequestHandler):  # nome exigido pelo runtime Python da Ve
             self._reply(200, rem_list())
         elif path == '/api/avisos/modelos':
             self._reply(200, rem_templates())
+        elif path == '/api/agente':
+            self._reply(200, ag_overview())
         else:
             raise RequestError('Página não encontrada.', 404)
 
