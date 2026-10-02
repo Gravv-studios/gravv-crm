@@ -826,7 +826,7 @@ AG_TOOLS = [
          'compromisso_id': {'type': 'string', 'description': 'id do compromisso (vem do resumo).'},
          'valor': {'type': 'number', 'description': 'Omitir = valor em aberto inteiro.'}, 'data': {'type': 'string'}},
          'required': ['compromisso_id']}},
-    {'name': 'resumo_financeiro', 'description': 'Saldo, quanto ainda dá pra gastar, compromissos e gastos do mês. Chame depois de lançar algo para responder com números atualizados.',
+    {'name': 'resumo_financeiro', 'description': 'Saldo, quanto ainda dá pra gastar, compromissos e gastos do mês. Raramente necessário: o resumo já está no contexto e cada lançamento devolve resumo_atualizado.',
      'input_schema': {'type': 'object', 'properties': {}}},
     {'name': 'listar_lancamentos', 'description': 'Últimos lançamentos pagos/recebidos, com id do pagamento (para desfazer).',
      'input_schema': {'type': 'object', 'properties': {'dias': {'type': 'integer', 'description': 'Quantos dias para trás (padrão 7).'}}}},
@@ -864,6 +864,13 @@ def ag_money(value):
     return v
 
 
+def ag_after():
+    """Números atualizados devolvidos junto com cada lançamento (evita outra chamada à IA)."""
+    r = fin_summary()
+    return {k: r[k] for k in ('saldo_no_banco', 'livre_para_gastar', 'livre_por_dia', 'dia_mais_apertado', 'ate',
+                              'total_gasto_no_mes', 'gastos_do_mes_por_categoria')}
+
+
 def ag_run_tool(name, args):
     args = args if isinstance(args, dict) else {}
     if name == 'resumo_financeiro':
@@ -877,7 +884,8 @@ def ag_run_tool(name, args):
                                          'category_id': ag_category_id(args.get('categoria'), tipo, escopo) or '',
                                          'account_id': ag_account(), 'paid_at': ag_date(args.get('data')),
                                          'payment_method': str(args.get('forma') or '')[:40], 'notas': AG_NOTA}})
-        return {'ok': True, 'lancamento_id': (r or {}).get('entry_id'), 'valor': valor, 'descricao': descricao}
+        return {'ok': True, 'lancamento_id': (r or {}).get('entry_id'), 'valor': valor, 'descricao': descricao,
+                'resumo_atualizado': ag_after()}
     if name == 'dar_baixa':
         eid = str(args.get('compromisso_id') or '')
         if not UUID.fullmatch(eid):
@@ -888,7 +896,7 @@ def ag_run_tool(name, args):
         valor = ag_money(args.get('valor')) if args.get('valor') else float(e[0]['open_amount'])
         db_rpc('settle_entry', {'p': {'entry_id': eid, 'amount': valor, 'paid_at': ag_date(args.get('data')),
                                       'account_id': ag_account(), 'notes': AG_NOTA}})
-        return {'ok': True, 'descricao': e[0]['descricao'], 'valor': valor}
+        return {'ok': True, 'descricao': e[0]['descricao'], 'valor': valor, 'resumo_atualizado': ag_after()}
     if name == 'listar_lancamentos':
         dias = max(1, min(60, int(args.get('dias') or 7)))
         desde = (datetime.now(BRASILIA).date() - timedelta(days=dias)).isoformat()
@@ -907,7 +915,7 @@ def ag_run_tool(name, args):
             ent = db_read('financial_entries', f"select=id,notas,paid_amount&id=eq.{pay[0]['entry_id']}")
             if ent and (ent[0].get('notas') or '') == AG_NOTA and float(ent[0]['paid_amount'] or 0) == 0:
                 supabase('PATCH', f"/rest/v1/financial_entries?id=eq.{ent[0]['id']}", {'status': 'cancelled'})
-        return {'ok': True}
+        return {'ok': True, 'resumo_atualizado': ag_after()}
     return {'erro': 'ferramenta desconhecida'}
 
 
@@ -922,6 +930,7 @@ O dinheiro dele está numa conta só (GRAVV + pessoal juntos). Prioridades, ness
 faculdade CEUB (dia 3; até o dia 3 sai com desconto), IPVA + licenciamento até o fim do ano, e comer bem. Depois disso, o resto é lazer.
 Regras:
 - Nunca invente números: use o resumo abaixo ou as ferramentas.
+- Depois de lançar, responda usando o resumo_atualizado que a ferramenta devolve (não chame resumo_financeiro de novo). Faça todos os lançamentos da mensagem de uma vez, na mesma rodada.
 - Quando ele contar um gasto ("gastei 32 no almoço", "abasteci 100"), lance com registrar_gasto e responda com o que sobrou livre até o dia mais apertado e quanto dá por dia.
 - Se o gasto for um compromisso da lista (ex.: "paguei a faculdade", "mandei a parcela do carro"), use dar_baixa com o id certo.
 - Se ele disser que um cliente pagou, procure o compromisso a receber e use dar_baixa; se não houver, registrar_entrada.
@@ -958,7 +967,7 @@ def anthropic_call(body):
         raise RequestError('A IA não respondeu agora. Tente de novo.', 503)
 
 
-def ag_history(canal, limit=12):
+def ag_history(canal, limit=8):
     status, rows = supabase('GET', f'/rest/v1/agente_mensagens?select=papel,texto&canal=eq.{quote(canal)}&order=created_at.desc&limit={limit}')
     msgs = []
     for r in reversed(rows if status == 200 and isinstance(rows, list) else []):
@@ -996,7 +1005,7 @@ def ag_chat(canal, texto, imagem=None):
     model = env('ANTHROPIC_MODEL') or AG_DEFAULT_MODEL
     acoes, resposta = [], ''
     for _ in range(6):
-        out = anthropic_call({'model': model, 'max_tokens': 900, 'system': system, 'tools': AG_TOOLS, 'messages': history})
+        out = anthropic_call({'model': model, 'max_tokens': 600, 'system': system, 'tools': AG_TOOLS, 'messages': history})
         blocks = out.get('content') or []
         history.append({'role': 'assistant', 'content': blocks})
         uses = [b for b in blocks if b.get('type') == 'tool_use']
