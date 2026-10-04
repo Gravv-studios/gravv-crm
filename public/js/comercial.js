@@ -311,10 +311,12 @@ route('/avisos', 'Avisos de cobrança', async () => {
   const rows = list.map((a, i) => `<tr><td data-label="Cliente"><b>${esc(a.cliente)}</b><small>${a.telefone ? esc(fmtPhone(a.telefone)) : '<em>sem WhatsApp</em>'}</small></td>
     <td data-label="O quê">${esc(a.descricao)}<small>${esc(avWhen(a))} · ${fdate(a.vencimento)}</small></td><td class="r" data-label="Valor">${money(a.valor)}</td>
     <td data-label="Aviso">${badge(a.etapa_nome, avTone[a.etapa])}</td>
-    <td class="r" data-label=""><div class="actions">${btn('Ver mensagem', 'av-preview', { i })}${btn('Mandar pelo meu WhatsApp', 'av-manual', { i }, missing.length ? 'primary small' : 'small')}${a.telefone && !missing.length ? btn('Enviar pela API', 'av-send', { i }, 'primary small') : ''}${!a.telefone && a.client_id ? `<a href="#/clientes/${esc(a.client_id)}">Colocar WhatsApp</a>` : ''}${btn('Ignorar', 'av-skip', { i }, 'small subtle')}</div></td></tr>`);
+    <td class="r" data-label=""><div class="actions">${btn('Ver mensagem', 'av-preview', { i })}${btn('Agendar envio automático', 'av-schedule', { i }, 'small')}${btn('Mandar pelo meu WhatsApp', 'av-manual', { i }, missing.length ? 'primary small' : 'small')}${a.telefone && !missing.length ? btn('Enviar pela API', 'av-send', { i }, 'primary small') : ''}${!a.telefone && a.client_id ? `<a href="#/clientes/${esc(a.client_id)}">Colocar WhatsApp</a>` : ''}${btn('Ignorar', 'av-skip', { i }, 'small subtle')}</div></td></tr>`);
   const hist = (r.historico || []).map(h => `<tr><td data-label="Quando">${fdt(h.created_at)}</td><td data-label="Cliente">${esc(clientName(h.client_id))}</td><td data-label="Aviso">${badge(ETAPA_LABEL[h.etapa] || h.etapa, avTone[h.etapa])}</td>
-    <td data-label="Status">${h.status === 'enviado' ? badge('Enviado', 'good') : badge('Ignorado', 'mute')}</td><td data-label="Mensagem"><small>${esc((h.texto || '').slice(0, 90))}</small></td></tr>`);
-  return notes + toolbar + panel(`Pra enviar agora (${list.length})`, table(['Cliente', 'O quê', ['Valor', 'r'], 'Aviso', ''], rows, 'Nenhum aviso pendente. Tudo em dia.'))
+    <td data-label="Status">${h.status === 'enviado' ? badge('Enviado', 'good') : h.status === 'erro' ? badge('Falhou', 'bad') + `<small>${esc(h.erro || '')}</small>` : badge('Ignorado', 'mute')}</td><td data-label="Mensagem"><small>${esc((h.texto || '').slice(0, 90))}</small></td></tr>`);
+  const ag = (r.agendados || []).map(h => `<tr><td data-label="Quando">${fdt(h.agendado_para)}</td><td data-label="Cliente">${esc(h.cliente || clientName(h.client_id))}${h.telefone ? '' : '<small class="bad-text">sem WhatsApp no cadastro</small>'}${h.erro ? `<small class="bad-text">Última tentativa: ${esc(h.erro)}</small>` : ''}</td><td data-label="O quê">${esc(h.descricao || '')}</td><td class="r" data-label="Valor">${money(h.valor)}</td><td class="r" data-label="">${btn('Cancelar', 'av-unschedule', { id: h.id }, 'small subtle')}</td></tr>`);
+  const agPanel = ag.length ? panel(`Agendados (${ag.length})`, (missing.length ? '<p class="muted pad">Só saem se os tokens da Meta estiverem na Vercel e os modelos aprovados até a hora marcada.</p>' : '') + table(['Quando', 'Cliente', 'O quê', ['Valor', 'r'], ''], ag)) : '';
+  return notes + toolbar + agPanel + panel(`Pra enviar agora (${list.length})`, table(['Cliente', 'O quê', ['Valor', 'r'], 'Aviso', ''], rows, 'Nenhum aviso pendente. Tudo em dia.'))
     + panel('Últimos avisos', table(['Quando', 'Cliente', 'Aviso', 'Status', 'Mensagem'], hist, 'Nenhum aviso enviado ainda.'));
 }, 'avisos');
 const ETAPA_LABEL = { antes: 'Vai vencer', no_dia: 'Vence hoje', atrasado: 'Vencido' };
@@ -324,6 +326,12 @@ ACTIONS['av-preview'] = d => { const a = avItem(d); if (!a) return;
     submit: 'Enviar no WhatsApp', onSubmit: async () => { await avSend(a); } }); };
 async function avSend(a) { await api('/api/avisos/enviar', { method: 'POST', body: { entry_id: a.entry_id, etapa: a.etapa } }); await saved(`Aviso enviado para ${a.cliente}.`); }
 ACTIONS['av-send'] = d => { const a = avItem(d); if (a) confirmSheet('Enviar aviso', `Mandar o aviso "${a.etapa_nome}" de ${money(a.valor)} para ${a.cliente} (${fmtPhone(a.telefone)})?`, async () => { await avSend(a); }, { label: 'Enviar', danger: false }); };
+const nextMorning = () => { const n = new Date(Date.now() - 3 * 3600e3); n.setUTCDate(n.getUTCDate() + 1); return n.toISOString().slice(0, 10) + 'T09:00'; };
+ACTIONS['av-schedule'] = d => { const a = avItem(d); if (!a) return;
+  openSheet({ title: `Agendar aviso para ${a.cliente}`, values: { quando: nextMorning() }, html: `<p class="muted">Sai sozinho pelo WhatsApp da GRAVV (API oficial) no horário marcado — o robô passa uma vez por dia, entre 9h e 10h. Se o título for pago antes, o aviso não sai.${a.telefone ? '' : ' <b>Coloque o WhatsApp do contato no cadastro antes disso.</b>'}</p><div class="bubble out" style="max-width:none;white-space:pre-wrap"><p>${esc(a.texto)}</p></div>`,
+    fields: [{ name: 'quando', label: 'Data e hora (Brasília)', type: 'datetime', required: true }], submit: 'Agendar',
+    onSubmit: async v => { await api('/api/avisos/agendar', { method: 'POST', body: { entry_id: a.entry_id, etapa: a.etapa, quando: v.quando } }); await saved('Aviso agendado.'); } }); };
+ACTIONS['av-unschedule'] = async d => { await api('/api/avisos/desagendar', { method: 'POST', body: { id: d.id } }); await saved('Agendamento cancelado.'); };
 ACTIONS['av-manual'] = d => { const a = avItem(d); if (!a) return;
   if (!AV.data?.config?.pix) return toast('Coloque a chave Pix em Ajustes antes de mandar.', 'bad');
   window.open(`https://wa.me/${a.telefone || ''}?text=${encodeURIComponent(a.texto)}`, '_blank', 'noopener');
