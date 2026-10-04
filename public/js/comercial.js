@@ -304,14 +304,14 @@ route('/avisos', 'Avisos de cobrança', async () => {
   AV.data = r; const cfg = r.config || {}; const list = r.avisos || [];
   const missing = Object.entries(r.whatsapp || {}).filter(([, v]) => !v).map(([k]) => k);
   const notes = [
-    missing.length ? `<div class="notice">Para enviar, falta configurar na Vercel: <b>${esc(missing.join(', '))}</b>. A lista abaixo já funciona; o botão Enviar libera quando isso estiver pronto.</div>` : '',
+    missing.length ? `<div class="notice">O envio automático (pela API) libera quando <b>${esc(missing.join(', '))}</b> estiver na Vercel. Enquanto isso, use <b>Mandar pelo meu WhatsApp</b>: abre o seu WhatsApp com a mensagem pronta, é só tocar em enviar.</div>` : '',
     !cfg.pix ? `<div class="notice">Coloque a <b>chave Pix da GRAVV</b> em Ajustes — ela vai em todas as mensagens.</div>` : '',
     list.some(a => !a.telefone) ? `<div class="notice">Tem cliente sem WhatsApp no cadastro. Coloque o número no cliente ou no contato principal (com DDD).</div>` : ''].join('');
   const toolbar = `<div class="toolbar"><p class="muted grow">Avisa ${cfg.dias_antes} dia(s) antes, no dia e ${cfg.dias_depois} dia(s) depois do vencimento. Cada aviso sai uma vez só. Você confere e manda.</p>${btn('Ajustes', 'av-config')}${btn('Modelos da Meta', 'av-models')}${btn('Atualizar', 'reload', {}, 'primary')}</div>`;
   const rows = list.map((a, i) => `<tr><td data-label="Cliente"><b>${esc(a.cliente)}</b><small>${a.telefone ? esc(fmtPhone(a.telefone)) : '<em>sem WhatsApp</em>'}</small></td>
     <td data-label="O quê">${esc(a.descricao)}<small>${esc(avWhen(a))} · ${fdate(a.vencimento)}</small></td><td class="r" data-label="Valor">${money(a.valor)}</td>
     <td data-label="Aviso">${badge(a.etapa_nome, avTone[a.etapa])}</td>
-    <td class="r" data-label=""><div class="actions">${btn('Ver mensagem', 'av-preview', { i })}${a.telefone ? btn('Enviar', 'av-send', { i }, 'primary small') : a.client_id ? `<a href="#/clientes/${esc(a.client_id)}">Colocar WhatsApp</a>` : ''}${btn('Ignorar', 'av-skip', { i }, 'small subtle')}</div></td></tr>`);
+    <td class="r" data-label=""><div class="actions">${btn('Ver mensagem', 'av-preview', { i })}${btn('Mandar pelo meu WhatsApp', 'av-manual', { i }, missing.length ? 'primary small' : 'small')}${a.telefone && !missing.length ? btn('Enviar pela API', 'av-send', { i }, 'primary small') : ''}${!a.telefone && a.client_id ? `<a href="#/clientes/${esc(a.client_id)}">Colocar WhatsApp</a>` : ''}${btn('Ignorar', 'av-skip', { i }, 'small subtle')}</div></td></tr>`);
   const hist = (r.historico || []).map(h => `<tr><td data-label="Quando">${fdt(h.created_at)}</td><td data-label="Cliente">${esc(clientName(h.client_id))}</td><td data-label="Aviso">${badge(ETAPA_LABEL[h.etapa] || h.etapa, avTone[h.etapa])}</td>
     <td data-label="Status">${h.status === 'enviado' ? badge('Enviado', 'good') : badge('Ignorado', 'mute')}</td><td data-label="Mensagem"><small>${esc((h.texto || '').slice(0, 90))}</small></td></tr>`);
   return notes + toolbar + panel(`Pra enviar agora (${list.length})`, table(['Cliente', 'O quê', ['Valor', 'r'], 'Aviso', ''], rows, 'Nenhum aviso pendente. Tudo em dia.'))
@@ -324,10 +324,15 @@ ACTIONS['av-preview'] = d => { const a = avItem(d); if (!a) return;
     submit: 'Enviar no WhatsApp', onSubmit: async () => { await avSend(a); } }); };
 async function avSend(a) { await api('/api/avisos/enviar', { method: 'POST', body: { entry_id: a.entry_id, etapa: a.etapa } }); await saved(`Aviso enviado para ${a.cliente}.`); }
 ACTIONS['av-send'] = d => { const a = avItem(d); if (a) confirmSheet('Enviar aviso', `Mandar o aviso "${a.etapa_nome}" de ${money(a.valor)} para ${a.cliente} (${fmtPhone(a.telefone)})?`, async () => { await avSend(a); }, { label: 'Enviar', danger: false }); };
+ACTIONS['av-manual'] = d => { const a = avItem(d); if (!a) return;
+  if (!AV.data?.config?.pix) return toast('Coloque a chave Pix em Ajustes antes de mandar.', 'bad');
+  window.open(`https://wa.me/${a.telefone || ''}?text=${encodeURIComponent(a.texto)}`, '_blank', 'noopener');
+  confirmSheet('Mandou a mensagem?', `Se você enviou o aviso pra ${a.cliente} no WhatsApp, confirme aqui pra ele sair da lista e ficar no histórico.${a.telefone ? '' : ' (Sem número no cadastro: escolha o contato no WhatsApp.)'}`,
+    async () => { await api('/api/avisos/manual', { method: 'POST', body: { entry_id: a.entry_id, etapa: a.etapa } }); await saved('Aviso registrado como enviado.'); }, { label: 'Sim, mandei', danger: false }); };
 ACTIONS['av-skip'] = async d => { const a = avItem(d); if (!a) return; await api('/api/avisos/ignorar', { method: 'POST', body: { entry_id: a.entry_id, etapa: a.etapa } }); await saved('Aviso ignorado.'); };
 ACTIONS['av-config'] = () => { const c = AV.data?.config || {};
   openSheet({ title: 'Ajustes dos avisos', values: c, fields: [
-    { name: 'pix', label: 'Chave Pix da GRAVV', required: true, full: true, hint: 'Vai escrita em todas as mensagens.' },
+    { name: 'pix', label: 'Chave Pix (com nome e banco)', required: true, full: true, hint: 'Vai escrita em todas as mensagens. Ex.: chave · nome do favorecido · banco.' },
     { name: 'dias_antes', label: 'Avisar quantos dias antes', type: 'number', min: 0, required: true },
     { name: 'dias_depois', label: 'Cobrar quantos dias depois de vencido', type: 'number', min: 1, required: true }],
     onSubmit: async v => { await db.add('settings', { key: 'lembretes', value: { pix: v.pix, dias_antes: Number(v.dias_antes), dias_depois: Number(v.dias_depois) } }); await saved('Ajustes salvos.'); } }); };
