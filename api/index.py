@@ -562,8 +562,9 @@ def rem_text(etapa, values):
     return body
 
 
-def rem_queue():
-    """Títulos a receber da GRAVV que pedem aviso hoje, já sem os avisados/ignorados."""
+def rem_queue(liberar=None):
+    """Títulos a receber da GRAVV que pedem aviso hoje, já sem os avisados/ignorados/agendados.
+    liberar: ids de títulos cujo agendamento deve ser ignorado (usado pelo envio agendado)."""
     cfg = rem_config()
     hoje = datetime.now(BRASILIA).date()
     limite = (hoje + timedelta(days=cfg['dias_antes'])).isoformat()
@@ -576,7 +577,9 @@ def rem_queue():
     status, done = supabase('GET', f'/rest/v1/wa_lembretes?select=entry_id,etapa&entry_id=in.({ids})')
     if status != 200:
         raise RequestError('Falta rodar o SQL dos avisos (05-lembretes-whatsapp.sql) no Supabase.', 503)
+    liberar = set(liberar or ())
     feitos = {(d['entry_id'], d['etapa']) for d in done or []}
+    agendados = {a['entry_id'] for a in rem_scheduled() if a['entry_id'] not in liberar}
     client_ids = sorted({e['client_id'] for e in entries if e.get('client_id')})
     clients, contacts = {}, {}
     if client_ids:
@@ -597,7 +600,7 @@ def rem_queue():
             etapa = 'antes'
         else:
             continue  # vencido há pouco: espera o prazo de tolerância
-        if (e['id'], etapa) in feitos:
+        if (e['id'], etapa) in feitos or e['id'] in agendados:
             continue
         cliente = clients.get(e.get('client_id')) or {}
         contato = contacts.get(e.get('client_id')) or {}
@@ -619,7 +622,15 @@ def rem_list():
         item.pop('_valores', None)
     status, hist = supabase('GET', '/rest/v1/wa_lembretes?select=entry_id,client_id,etapa,status,telefone,texto,created_at'
                                    '&order=created_at.desc&limit=30')
-    return {'config': cfg, 'avisos': fila, 'whatsapp': wa_configured(), 'historico': hist if status == 200 else []}
+    hist = hist if status == 200 and isinstance(hist, list) else []
+    agendados = rem_scheduled()
+    if agendados:
+        ids = ','.join(sorted({h['entry_id'] for h in agendados}))
+        nomes = {e['id']: e for e in db_read('v_entries', f'select=id,descricao,open_amount,client_nome&id=in.({ids})')}
+        for h in agendados:
+            e = nomes.get(h['entry_id']) or {}
+            h.update({'descricao': e.get('descricao'), 'valor': e.get('open_amount'), 'cliente': e.get('client_nome')})
+    return {'config': cfg, 'avisos': fila, 'whatsapp': wa_configured(), 'agendados': agendados, 'historico': hist}
 
 
 def rem_pick(data):
@@ -642,6 +653,13 @@ def rem_log(item, status, message_id=''):
 
 def rem_send(data):
     item = rem_pick(data)
+    message_id = rem_send_item(item)
+    rem_log(item, 'enviado', message_id)
+    return {'ok': True, 'id': message_id}
+
+
+def rem_send_item(item):
+    """Manda o modelo aprovado pela API oficial. Devolve o id da mensagem."""
     if not item['telefone']:
         raise RequestError(f'{item["cliente"]} está sem WhatsApp no cadastro. Coloque o número no cliente ou no contato principal.')
     cfg = rem_config()
@@ -659,15 +677,80 @@ def rem_send(data):
             raise RequestError('O modelo de mensagem ainda não foi aprovado pela Meta. Veja o status em Avisos › Modelos.', 409)
         raise RequestError('A Meta recusou o envio: ' + detail + '.', 502)
     message_id = ((result.get('messages') or [{}])[0]).get('id', '')
-    rem_log(item, 'enviado', message_id)
     wa_store([{'id': message_id, 'telefone': item['telefone'], 'nome': item['contato'], 'direcao': 'saida', 'tipo': 'template',
                'texto': item['texto'], 'enviado_em': datetime.now(timezone.utc).isoformat(), 'origem': 'crm', 'status': 'sent'}], [])
-    return {'ok': True, 'id': message_id}
+    return message_id
 
 
 def rem_skip(data):
     rem_log(rem_pick(data), 'ignorado')
     return {'ok': True}
+
+
+def rem_scheduled():
+    """Avisos agendados ficam em settings.avisos_agendados (lista pequena, um usuário só)."""
+    status, rows = supabase('GET', '/rest/v1/settings?key=eq.avisos_agendados&select=value')
+    value = (rows[0].get('value') if status == 200 and rows else None) or {}
+    return [a for a in (value.get('itens') or []) if isinstance(a, dict) and a.get('entry_id')]
+
+
+def rem_save_scheduled(itens):
+    code, result = supabase('POST', '/rest/v1/settings?on_conflict=key', [{'key': 'avisos_agendados', 'value': {'itens': itens}}],
+                            headers={'Prefer': 'resolution=merge-duplicates,return=minimal'})
+    if code not in (200, 201, 204):
+        raise db_error(code, result, 'Não foi possível salvar o agendamento.')
+
+
+def rem_schedule(data):
+    """Agenda o aviso pra sair sozinho pela API: o cron diário da Vercel (9h–10h) manda os que já chegaram na hora."""
+    item = rem_pick(data)
+    quando = str((data or {}).get('quando') or '').replace('Z', '+00:00')
+    try:
+        alvo = datetime.fromisoformat(quando)
+    except ValueError:
+        raise RequestError('Data e hora inválidas.')
+    if alvo.tzinfo is None:
+        alvo = alvo.replace(tzinfo=BRASILIA)
+    if alvo < datetime.now(timezone.utc) - timedelta(minutes=5):
+        raise RequestError('Escolha um horário no futuro.')
+    itens = [a for a in rem_scheduled() if a['entry_id'] != item['entry_id']]
+    itens.append({'id': hashlib.sha1(f"{item['entry_id']}{alvo.isoformat()}".encode()).hexdigest()[:16],
+                  'entry_id': item['entry_id'], 'etapa': item['etapa'], 'client_id': item.get('client_id'),
+                  'telefone': item.get('telefone') or '', 'agendado_para': alvo.isoformat(), 'erro': ''})
+    rem_save_scheduled(itens)
+    return {'ok': True, 'agendado_para': alvo.isoformat()}
+
+
+def rem_unschedule(data):
+    rid = str((data or {}).get('id') or '')
+    rem_save_scheduled([a for a in rem_scheduled() if a.get('id') != rid])
+    return {'ok': True}
+
+
+def rem_run_scheduled():
+    """Chamado pelo cron da Vercel: manda os avisos agendados que já chegaram na hora.
+    Se falhar (sem número, modelo ainda em análise…), fica agendado com o erro e tenta de novo no dia seguinte."""
+    itens = rem_scheduled()
+    agora = datetime.now(timezone.utc)
+    vencidos = [a for a in itens if datetime.fromisoformat(a['agendado_para']) <= agora]
+    if not vencidos:
+        return {'ok': True, 'enviados': 0}
+    _, fila = rem_queue(liberar={a['entry_id'] for a in vencidos})
+    por_titulo = {i['entry_id']: i for i in fila}
+    restantes, enviados, falhas = [a for a in itens if a not in vencidos], 0, []
+    for a in vencidos:
+        item = por_titulo.get(a['entry_id'])
+        if not item:
+            continue  # pago, cancelado ou já avisado: sai da lista sem mandar
+        try:
+            mid = rem_send_item(item)
+            rem_log(item, 'enviado', mid)
+            enviados += 1
+        except RequestError as exc:
+            restantes.append({**a, 'erro': str(exc)[:300]})
+            falhas.append(str(exc))
+    rem_save_scheduled(restantes)
+    return {'ok': True, 'enviados': enviados, 'falhas': falhas}
 
 
 def rem_manual(data):
@@ -1357,6 +1440,12 @@ class handler(BaseHTTPRequestHandler):  # nome exigido pelo runtime Python da Ve
                 traceback.print_exc(file=sys.stderr)  # o agente nunca derruba o webhook
             self._reply(200, {'ok': True})
             return
+        if path == '/api/cron':  # cron da Vercel: manda os avisos agendados
+            secret = env('CRON_SECRET')
+            if secret and not hmac.compare_digest(self.headers.get('Authorization', ''), 'Bearer ' + secret):
+                raise RequestError('Não autorizado.', 401)
+            self._reply(200, rem_run_scheduled())
+            return
         if method == 'OPTIONS':
             raise RequestError('Acesso de outro site não habilitado.', 403)
         if path == '/api/health':
@@ -1424,6 +1513,10 @@ class handler(BaseHTTPRequestHandler):  # nome exigido pelo runtime Python da Ve
                 self._reply(200, rem_skip(self._json()))
             elif path == '/api/avisos/manual':
                 self._reply(200, rem_manual(self._json()))
+            elif path == '/api/avisos/agendar':
+                self._reply(200, rem_schedule(self._json()))
+            elif path == '/api/avisos/desagendar':
+                self._reply(200, rem_unschedule(self._json()))
             elif path == '/api/avisos/modelos':
                 self._reply(200, rem_create_templates())
             elif path == '/api/agente/chat':
