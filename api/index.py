@@ -670,6 +670,12 @@ def rem_skip(data):
     return {'ok': True}
 
 
+def rem_manual(data):
+    """Marca como enviado um aviso que o Marcos mandou pelo próprio WhatsApp (link wa.me)."""
+    rem_log(rem_pick(data), 'enviado', 'manual')
+    return {'ok': True}
+
+
 def rem_templates():
     names = {t[0]: etapa for etapa, t in WA_TEMPLATES.items()}
     status, result = graph('GET', f'/{wa_waba()}/message_templates?fields=name,status,language,rejected_reason&limit=200')
@@ -1416,6 +1422,8 @@ class handler(BaseHTTPRequestHandler):  # nome exigido pelo runtime Python da Ve
                 self._reply(200, rem_send(self._json()))
             elif path == '/api/avisos/ignorar':
                 self._reply(200, rem_skip(self._json()))
+            elif path == '/api/avisos/manual':
+                self._reply(200, rem_manual(self._json()))
             elif path == '/api/avisos/modelos':
                 self._reply(200, rem_create_templates())
             elif path == '/api/agente/chat':
